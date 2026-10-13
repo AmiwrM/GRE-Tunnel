@@ -93,7 +93,7 @@ apply_firewall_and_sysctl() {
     iptables -C INPUT -p gre -j ACCEPT 2>/dev/null || iptables -A INPUT -p gre -j ACCEPT
     iptables -C OUTPUT -p gre -j ACCEPT 2>/dev/null || iptables -A OUTPUT -p gre -j ACCEPT
 
-    # MSS Clamping جهت جلوگیری از افت پکت و اختلال در وبسایت‌ها
+    # MSS Clamping جهت جلوگیری از افت پکت و کندی وب
     iptables -t mangle -C FORWARD -o "$dev" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || \
       iptables -t mangle -A FORWARD -o "$dev" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
   fi
@@ -142,7 +142,7 @@ create_tunnel() {
   ip link set "$TUNNEL_DEV" down 2>/dev/null || true
   ip tunnel del "$TUNNEL_DEV" 2>/dev/null || true
 
-  # ایجاد تانل
+  # ساخت تانل
   ip tunnel add "$TUNNEL_DEV" mode gre local "$LOCAL_PUBLIC_IP" remote "$REMOTE_PUBLIC_IP" ttl 255
   ip addr add "$LOCAL_GRE_IP" dev "$TUNNEL_DEV"
   ip link set "$TUNNEL_DEV" mtu "$MTU_VAL"
@@ -220,26 +220,23 @@ menu_config_tunnel() {
 
   echo
   echo "--- Private / Tunnel IP Setup ---"
-  echo "Enter a subnet prefix (e.g. 10.10.30 or 172.16.1)."
+  echo "Enter subnet base (e.g. 10.10.30 or 172.16.1)."
   echo "The script will automatically assign:"
-  echo "  - Iran Server:   <prefix>.1/30 (Local)  | <prefix>.2 (Remote)"
-  echo "  - Kharej Server: <prefix>.2/30 (Local)  | <prefix>.1 (Remote)"
+  echo "  - Iran Server:   <base>.1/30 (Local)  | <base>.2 (Remote)"
+  echo "  - Kharej Server: <base>.2/30 (Local)  | <base>.1 (Remote)"
   echo
-  read -rp "Tunnel Subnet Prefix [Default: 10.10.10]: " input_prefix
+  read -rp "Tunnel Subnet [Default: 10.10.10]: " input_prefix
   input_prefix="${input_prefix:-10.10.10}"
 
-  # پاکسازی ورودی کاربر در صورت وارد کردن .0 یا /30
-  clean_prefix=$(echo "$input_prefix" | sed -E 's#/.*$##; s#\.[0-9]+$##' 2>/dev/null || echo "$input_prefix")
-  IFS='.' read -r -a octs <<< "$clean_prefix"
-  if [ "${#octs[@]}" -eq 3 ]; then
-    BASE_NET="$clean_prefix"
-  elif [ "${#octs[@]}" -ge 4 ]; then
-    BASE_NET="${octs[0]}.${octs[1]}.${octs[2]}"
+  # استخراج دقیق ۳ بخش اول IP بدون باگ sed
+  if [[ "$input_prefix" =~ ^([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}) ]]; then
+    BASE_NET="${BASH_REMATCH[1]}"
   else
+    echo "[-] Invalid subnet format! Using default: 10.10.10"
     BASE_NET="10.10.10"
   fi
 
-  # تفکیک خودکار و هوشمند بر اساس نقش
+  # انتساب دقیق و خودکار بر اساس نقش سرور
   if [ "$ROLE" == "1" ]; then
     LOCAL_GRE_IP="${BASE_NET}.1/30"
     REMOTE_GRE_IP="${BASE_NET}.2"
@@ -249,15 +246,15 @@ menu_config_tunnel() {
   fi
 
   echo
-  echo "[i] Assigned IP Scheme for $SERVER_ROLE:"
+  echo "[✓] Configured IPs for $SERVER_ROLE:"
   echo "    Local GRE IP:  $LOCAL_GRE_IP"
   echo "    Remote GRE IP: $REMOTE_GRE_IP"
   echo
 
-  read -rp "Customize these private IPs manually? [y/N]: " custom_yn
+  read -rp "Do you want to change these private IPs manually? [y/N]: " custom_yn
   if [[ "$custom_yn" =~ ^[Yy]$ ]]; then
-    read -rp "Enter Local GRE IP with CIDR: " LOCAL_GRE_IP
-    read -rp "Enter Remote GRE IP: " REMOTE_GRE_IP
+    read -rp "Enter Local GRE IP with CIDR (e.g. ${BASE_NET}.1/30): " LOCAL_GRE_IP
+    read -rp "Enter Remote GRE IP (e.g. ${BASE_NET}.2): " REMOTE_GRE_IP
   fi
 
   read -rp "Tunnel MTU [Default: $DEFAULT_MTU]: " input_mtu
@@ -380,7 +377,6 @@ install_service() {
     return 1
   fi
 
-  # پیدا کردن مسیر دقیق فایل اسکریپت جاری بدون باگ -bash
   local script_source="${BASH_SOURCE[0]:-$0}"
   if [ ! -f "$script_source" ]; then
     script_source="$(command -v "$0" || true)"
