@@ -80,7 +80,6 @@ load_config() {
 
 apply_firewall_and_sysctl() {
   local dev="$1"
-  # IPv4 forwarding
   sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
   if [ -f /etc/sysctl.conf ]; then
     if grep -q '^net.ipv4.ip_forward' /etc/sysctl.conf; then
@@ -90,13 +89,11 @@ apply_firewall_and_sysctl() {
     fi
   fi
 
-  # iptables rules
   if command -v iptables >/dev/null 2>&1; then
-    # Allow GRE protocol
     iptables -C INPUT -p gre -j ACCEPT 2>/dev/null || iptables -A INPUT -p gre -j ACCEPT
     iptables -C OUTPUT -p gre -j ACCEPT 2>/dev/null || iptables -A OUTPUT -p gre -j ACCEPT
 
-    # MSS Clamping (Prevents packet fragmentation on tunnel links)
+    # MSS Clamping جهت جلوگیری از افت پکت و اختلال در وبسایت‌ها
     iptables -t mangle -C FORWARD -o "$dev" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || \
       iptables -t mangle -A FORWARD -o "$dev" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
   fi
@@ -120,7 +117,7 @@ create_tunnel() {
   MTU_VAL="${MTU_VAL:-$DEFAULT_MTU}"
 
   if [ -z "$LOCAL_PUBLIC_IP" ] || ! validate_ipv4 "$LOCAL_PUBLIC_IP"; then
-    echo "[-] Invalid or undetected local public IPv4: '$LOCAL_PUBLIC_IP'" >&2
+    echo "[-] Invalid local public IPv4: '$LOCAL_PUBLIC_IP'" >&2
     return 1
   fi
 
@@ -129,19 +126,23 @@ create_tunnel() {
     return 1
   fi
 
-  echo "[*] Role: ${SERVER_ROLE:-Custom} | Interface: $TUNNEL_DEV | MTU: $MTU_VAL"
+  echo "=========================================="
+  echo "[*] Role:             ${SERVER_ROLE:-Custom}"
+  echo "[*] Tunnel Interface: $TUNNEL_DEV"
   echo "[*] Local Public IP:  $LOCAL_PUBLIC_IP"
   echo "[*] Remote Public IP: $REMOTE_PUBLIC_IP"
-  echo "[*] Tunnel IP Local:  $LOCAL_GRE_IP"
-  echo "[*] Tunnel IP Remote: $REMOTE_GRE_IP"
+  echo "[*] Tunnel IP (Self): $LOCAL_GRE_IP"
+  echo "[*] Tunnel IP (Peer): $REMOTE_GRE_IP"
+  echo "[*] MTU:              $MTU_VAL"
+  echo "=========================================="
 
   modprobe ip_gre 2>/dev/null || true
 
-  # Clean existing interface
+  # ریست اینترفیس قبلی
   ip link set "$TUNNEL_DEV" down 2>/dev/null || true
   ip tunnel del "$TUNNEL_DEV" 2>/dev/null || true
 
-  # Build GRE interface
+  # ایجاد تانل
   ip tunnel add "$TUNNEL_DEV" mode gre local "$LOCAL_PUBLIC_IP" remote "$REMOTE_PUBLIC_IP" ttl 255
   ip addr add "$LOCAL_GRE_IP" dev "$TUNNEL_DEV"
   ip link set "$TUNNEL_DEV" mtu "$MTU_VAL"
@@ -155,7 +156,7 @@ create_tunnel() {
   apply_firewall_and_sysctl "$TUNNEL_DEV"
 
   echo
-  echo "[✓] GRE tunnel interface ($TUNNEL_DEV) is UP!"
+  echo "[✓] GRE tunnel interface ($TUNNEL_DEV) is successfully UP!"
 
   if [ "$interactive" -eq 1 ]; then
     echo
@@ -172,7 +173,7 @@ create_tunnel() {
           *) echo "[i] Service not installed." ;;
         esac
         ;;
-      *) echo "[i] Configuration discarded from storage." ;;
+      *) echo "[i] Configuration discarded." ;;
     esac
   fi
 
@@ -185,7 +186,7 @@ menu_config_tunnel() {
   echo "       Configure GRE Tunnel           "
   echo "======================================"
   echo "1) Iran Server"
-  echo "2) Kharej (Foreign) Server"
+  echo "2) Kharej Server"
   echo
   read -rp "Select server role [1-2]: " ROLE
   if [[ "$ROLE" != "1" && "$ROLE" != "2" ]]; then
@@ -195,51 +196,70 @@ menu_config_tunnel() {
 
   if [ "$ROLE" == "1" ]; then
     SERVER_ROLE="IRAN"
-    DEFAULT_LOCAL_GRE="10.10.10.1/30"
-    DEFAULT_REMOTE_GRE="10.10.10.2"
   else
     SERVER_ROLE="KHAREJ"
-    DEFAULT_LOCAL_GRE="10.10.10.2/30"
-    DEFAULT_REMOTE_GRE="10.10.10.1"
   fi
 
   TUNNEL_DEV="$DEFAULT_TUNNEL_DEV"
   read -rp "Interface name [Default: $DEFAULT_TUNNEL_DEV]: " input_dev
   TUNNEL_DEV="${input_dev:-$DEFAULT_TUNNEL_DEV}"
 
-  # Public IP detection & prompt
   detected_ip=$(detect_local_public_ip)
   read -rp "Local Public IP [Detected: ${detected_ip:-None}]: " input_local_ip
   LOCAL_PUBLIC_IP="${input_local_ip:-$detected_ip}"
   if ! validate_ipv4 "$LOCAL_PUBLIC_IP"; then
-    echo "[-] Invalid Local Public IPv4 format."
+    echo "[-] Invalid Local Public IPv4."
     return
   fi
 
   read -rp "Remote Server Public IPv4: " REMOTE_PUBLIC_IP
   if ! validate_ipv4 "$REMOTE_PUBLIC_IP"; then
-    echo "[-] Invalid Remote Public IPv4 format."
+    echo "[-] Invalid Remote Public IPv4."
     return
   fi
 
-  # Custom Private IPs
   echo
   echo "--- Private / Tunnel IP Setup ---"
-  read -rp "Local Tunnel IP with CIDR [Default: $DEFAULT_LOCAL_GRE]: " input_local_gre
-  LOCAL_GRE_IP="${input_local_gre:-$DEFAULT_LOCAL_GRE}"
-  if ! validate_cidr_ipv4 "$LOCAL_GRE_IP"; then
-    echo "[-] Invalid CIDR format for Local Tunnel IP. Example: 10.10.10.1/30 or 172.16.0.1/30"
-    return
+  echo "Enter a subnet prefix (e.g. 10.10.30 or 172.16.1)."
+  echo "The script will automatically assign:"
+  echo "  - Iran Server:   <prefix>.1/30 (Local)  | <prefix>.2 (Remote)"
+  echo "  - Kharej Server: <prefix>.2/30 (Local)  | <prefix>.1 (Remote)"
+  echo
+  read -rp "Tunnel Subnet Prefix [Default: 10.10.10]: " input_prefix
+  input_prefix="${input_prefix:-10.10.10}"
+
+  # پاکسازی ورودی کاربر در صورت وارد کردن .0 یا /30
+  clean_prefix=$(echo "$input_prefix" | sed -E 's#/.*$##; s#\.[0-9]+$##' 2>/dev/null || echo "$input_prefix")
+  IFS='.' read -r -a octs <<< "$clean_prefix"
+  if [ "${#octs[@]}" -eq 3 ]; then
+    BASE_NET="$clean_prefix"
+  elif [ "${#octs[@]}" -ge 4 ]; then
+    BASE_NET="${octs[0]}.${octs[1]}.${octs[2]}"
+  else
+    BASE_NET="10.10.10"
   fi
 
-  read -rp "Remote Tunnel IP [Default: $DEFAULT_REMOTE_GRE]: " input_remote_gre
-  REMOTE_GRE_IP="${input_remote_gre:-$DEFAULT_REMOTE_GRE}"
-  if ! validate_ipv4 "$REMOTE_GRE_IP"; then
-    echo "[-] Invalid Remote Tunnel IP format."
-    return
+  # تفکیک خودکار و هوشمند بر اساس نقش
+  if [ "$ROLE" == "1" ]; then
+    LOCAL_GRE_IP="${BASE_NET}.1/30"
+    REMOTE_GRE_IP="${BASE_NET}.2"
+  else
+    LOCAL_GRE_IP="${BASE_NET}.2/30"
+    REMOTE_GRE_IP="${BASE_NET}.1"
   fi
 
-  # MTU
+  echo
+  echo "[i] Assigned IP Scheme for $SERVER_ROLE:"
+  echo "    Local GRE IP:  $LOCAL_GRE_IP"
+  echo "    Remote GRE IP: $REMOTE_GRE_IP"
+  echo
+
+  read -rp "Customize these private IPs manually? [y/N]: " custom_yn
+  if [[ "$custom_yn" =~ ^[Yy]$ ]]; then
+    read -rp "Enter Local GRE IP with CIDR: " LOCAL_GRE_IP
+    read -rp "Enter Remote GRE IP: " REMOTE_GRE_IP
+  fi
+
   read -rp "Tunnel MTU [Default: $DEFAULT_MTU]: " input_mtu
   MTU_VAL="${input_mtu:-$DEFAULT_MTU}"
 
@@ -269,7 +289,7 @@ status_check() {
 
   echo "[i] Interface:      $dev"
   echo "[i] Link State:     $link_state"
-  echo "[i] Inner IP:       ${local_addr:-Not set}"
+  echo "[i] Tunnel Local:   ${local_addr:-Not set}"
 
   local tun_info
   tun_info=$(ip tunnel show "$dev" 2>/dev/null || true)
@@ -293,7 +313,7 @@ status_check() {
   fi
 
   if [ -n "$target_inner" ]; then
-    echo "[*] Pinging Tunnel Inner IP ($target_inner)..."
+    echo "[*] Pinging Tunnel Remote IP ($target_inner)..."
     local ping_result
     ping_result=$(ping -c 3 -W 2 "$target_inner" 2>&1 || true)
     if echo "$ping_result" | grep -qE '([1-9]) (packets )?received'; then
@@ -304,7 +324,7 @@ status_check() {
       echo "    -> Tunnel Link is DOWN / NOT RESPONDING [✗]"
     fi
   else
-    echo "[i] Remote inner IP not loaded. Save configuration to test tunnel latency."
+    echo "[i] Remote inner IP not loaded. Save configuration to test tunnel ping."
   fi
 
   echo "--------------------------------------"
@@ -345,7 +365,7 @@ remove_tun() {
     *) echo "[i] Config retained." ;;
   esac
 
-  if [ -f "$SERVICE_UNIT" ] || systemctl list-unit-files | grep -q '^gre-tunnel.service'; then
+  if [ -f "$SERVICE_UNIT" ] || systemctl list-unit-files 2>/dev/null | grep -q '^gre-tunnel.service'; then
     read -rp "Uninstall systemd boot service? [y/N]: " sy
     case "$sy" in
       [Yy]*) uninstall_service ;;
@@ -360,8 +380,20 @@ install_service() {
     return 1
   fi
 
+  # پیدا کردن مسیر دقیق فایل اسکریپت جاری بدون باگ -bash
+  local script_source="${BASH_SOURCE[0]:-$0}"
+  if [ ! -f "$script_source" ]; then
+    script_source="$(command -v "$0" || true)"
+  fi
+
+  if [ ! -f "$script_source" ]; then
+    echo "[-] Cannot detect script file path directly." >&2
+    echo "[-] Please save the script to a file (e.g. /root/gre.sh) and run with: bash /root/gre.sh" >&2
+    return 1
+  fi
+
   mkdir -p "$(dirname "$INSTALL_BIN")"
-  cp -f "$0" "$INSTALL_BIN"
+  cp -f -- "$script_source" "$INSTALL_BIN"
   chmod 755 "$INSTALL_BIN"
 
   cat > "$SERVICE_UNIT" <<EOF
@@ -382,7 +414,13 @@ EOF
 
   systemctl daemon-reload
   systemctl enable --now gre-tunnel.service
-  echo "[✓] Service installed and started: gre-tunnel.service"
+
+  if systemctl is-active --quiet gre-tunnel.service; then
+    echo "[✓] Service installed and started successfully: gre-tunnel.service"
+  else
+    echo "[-] Service installed but failed to start. Run: journalctl -xeu gre-tunnel.service"
+    return 1
+  fi
 }
 
 uninstall_service() {
