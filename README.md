@@ -13,4 +13,4 @@
 ## ⚡ Install
 
 ```bash
-bash <(curl -Ls --ipv4 https://raw.githubusercontent.com/SETARENOVIN/gre/refs/heads/main/gre.sh)
+bash <(curl -Ls --ipv4 https://raw.githubusercontent.com/AmiwrM/GRE-Tunnel/refs/heads/main/gre.sh)
