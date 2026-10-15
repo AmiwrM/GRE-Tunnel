@@ -1,10 +1,15 @@
 #!/bin/bash
-set -euo pipefail
+# با -e کار نمی‌کنیم تا هر خطای جزئی باعث خروج از اسکریپت نشود؛
+# هر عملیات خطاپذیر خودش خطا را مدیریت می‌کند.
+set -o pipefail
+
+VERSION="2.0.0"
 
 CONF_FILE="/etc/gre-tunnel.conf"
 CONF_DIR="/etc/gre-tunnel.d"
 INSTALL_BIN="/usr/local/bin/gre.sh"
 SERVICE_UNIT="/etc/systemd/system/gre-tunnel.service"
+MOTD_FILE="/etc/update-motd.d/99-gre-tunnel"
 DEFAULT_TUNNEL_DEV="gre1"
 DEFAULT_MTU="1390"
 
@@ -60,6 +65,15 @@ get_server_ipv4_cached() {
     CACHED_SERVER_IPV4=$(detect_local_public_ip)
   fi
   printf '%s' "$CACHED_SERVER_IPV4"
+}
+
+# پیدا کردن اولین اینترفیس gre آزاد (gre1, gre2, ...)
+next_tunnel_dev() {
+  local i=1
+  while ip link show "gre$i" >/dev/null 2>&1; do
+    i=$((i + 1))
+  done
+  echo "gre$i"
 }
 
 write_config_block() {
@@ -213,21 +227,11 @@ create_tunnel() {
 
   if [ "$interactive" -eq 1 ]; then
     echo
-    read -rp "Save this configuration to $CONF_FILE? [Y/n]: " yn
-    yn="${yn:-y}"
-    case "$yn" in
-      [Yy]*)
-        save_config
-        echo
-        read -rp "Install & enable systemd service on boot? [Y/n]: " sn
-        sn="${sn:-y}"
-        case "$sn" in
-          [Yy]*) install_service || echo "[-] Failed to setup systemd unit." ;;
-          *) echo "[i] Service not installed." ;;
-        esac
-        ;;
-      *) echo "[i] Configuration discarded." ;;
-    esac
+    # ذخیرهٔ خودکار کانفیگ + فعال‌سازی ماندگاری پس از ریبوت
+    save_config
+    echo
+    install_service || echo "[-] Boot persistence could not be enabled (service setup failed)."
+    install_motd || true
   fi
 
   return 0
@@ -238,58 +242,62 @@ menu_config_tunnel() {
   echo "======================================"
   echo "       Configure GRE Tunnel           "
   echo "======================================"
+
   echo "1) Iran Server"
   echo "2) Kharej Server"
   echo
-  read -rp "Select server role [1-2]: " ROLE
-  if [[ "$ROLE" != "1" && "$ROLE" != "2" ]]; then
-    echo "[-] Invalid selection."
+  read -rp "Select server role [1-2]: " role_in
+  case "$role_in" in
+    1) ROLE="1"; SERVER_ROLE="IRAN" ;;
+    2) ROLE="2"; SERVER_ROLE="KHAREJ" ;;
+    *) echo "[-] Invalid selection."; return ;;
+  esac
+
+  # کمترین ورودی الزامی: آی‌پی عمومی سمت مقابل
+  read -rp "Remote (peer) Public IPv4: " REMOTE_PUBLIC_IP
+  if ! validate_ipv4 "$REMOTE_PUBLIC_IP"; then
+    echo "[-] Invalid Remote Public IPv4."
     return
   fi
 
-  if [ "$ROLE" == "1" ]; then
-    SERVER_ROLE="IRAN"
-  else
-    SERVER_ROLE="KHAREJ"
-  fi
-
-  TUNNEL_DEV="$DEFAULT_TUNNEL_DEV"
-  read -rp "Interface name [Default: $DEFAULT_TUNNEL_DEV]: " input_dev
-  TUNNEL_DEV="${input_dev:-$DEFAULT_TUNNEL_DEV}"
-
+  # آی‌پی عمومی این سرور به صورت خودکار تشخیص داده می‌شود
+  local detected_ip
   detected_ip=$(detect_local_public_ip)
-  read -rp "Local Public IP [Detected: ${detected_ip:-None}]: " input_local_ip
+  read -rp "This server's Public IPv4 [Detected: ${detected_ip:-None}]: " input_local_ip
   LOCAL_PUBLIC_IP="${input_local_ip:-$detected_ip}"
   if ! validate_ipv4 "$LOCAL_PUBLIC_IP"; then
     echo "[-] Invalid Local Public IPv4."
     return
   fi
 
-  read -rp "Remote Server Public IPv4: " REMOTE_PUBLIC_IP
-  if ! validate_ipv4 "$REMOTE_PUBLIC_IP"; then
-    echo "[-] Invalid Remote Public IPv4."
-    return
-  fi
+  # مقادیر پیش‌فرض (در حالت عادی نیازی به تغییر ندارند)
+  TUNNEL_DEV="$(next_tunnel_dev)"
+  BASE_NET="10.10.10"
+  MTU_VAL="$DEFAULT_MTU"
 
   echo
-  echo "--- Private / Tunnel IP Setup ---"
-  echo "Enter subnet base (e.g. 10.10.30 or 172.16.1)."
-  echo "The script will automatically assign:"
-  echo "  - Iran Server:   <base>.1/30 (Local)  | <base>.2 (Remote)"
-  echo "  - Kharej Server: <base>.2/30 (Local)  | <base>.1 (Remote)"
-  echo
-  read -rp "Tunnel Subnet [Default: 10.10.10]: " input_prefix
-  input_prefix="${input_prefix:-10.10.10}"
+  read -rp "Use advanced settings (interface / subnet / MTU)? [y/N]: " adv_yn
+  if [[ "$adv_yn" =~ ^[Yy]$ ]]; then
+    local input_dev input_prefix input_mtu
+    read -rp "Interface name [Default: $TUNNEL_DEV]: " input_dev
+    TUNNEL_DEV="${input_dev:-$TUNNEL_DEV}"
 
-  # استخراج دقیق ۳ بخش اول IP بدون باگ sed
-  if [[ "$input_prefix" =~ ^([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}) ]]; then
-    BASE_NET="${BASH_REMATCH[1]}"
-  else
-    echo "[-] Invalid subnet format! Using default: 10.10.10"
-    BASE_NET="10.10.10"
+    echo "Subnet base sets the two inner tunnel IPs automatically:"
+    echo "  - Iran Server:   <base>.1/30 (Local) | <base>.2 (Remote)"
+    echo "  - Kharej Server: <base>.2/30 (Local) | <base>.1 (Remote)"
+    read -rp "Tunnel Subnet base (e.g. 10.10.30) [Default: $BASE_NET]: " input_prefix
+    input_prefix="${input_prefix:-$BASE_NET}"
+    if [[ "$input_prefix" =~ ^([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}) ]]; then
+      BASE_NET="${BASH_REMATCH[1]}"
+    else
+      echo "[-] Invalid subnet format! Using default: $BASE_NET"
+    fi
+
+    read -rp "Tunnel MTU [Default: $DEFAULT_MTU]: " input_mtu
+    MTU_VAL="${input_mtu:-$DEFAULT_MTU}"
   fi
 
-  # انتساب دقیق و خودکار بر اساس نقش سرور
+  # انتساب خودکار آی‌پی‌های داخلی تانل بر اساس نقش سرور
   if [ "$ROLE" == "1" ]; then
     LOCAL_GRE_IP="${BASE_NET}.1/30"
     REMOTE_GRE_IP="${BASE_NET}.2"
@@ -299,19 +307,21 @@ menu_config_tunnel() {
   fi
 
   echo
-  echo "[✓] Configured IPs for $SERVER_ROLE:"
-  echo "    Local GRE IP:  $LOCAL_GRE_IP"
-  echo "    Remote GRE IP: $REMOTE_GRE_IP"
+  echo "[✓] Summary for $SERVER_ROLE:"
+  echo "    Interface:        $TUNNEL_DEV"
+  echo "    Local Public IP:  $LOCAL_PUBLIC_IP"
+  echo "    Remote Public IP: $REMOTE_PUBLIC_IP"
+  echo "    Local GRE IP:     $LOCAL_GRE_IP"
+  echo "    Remote GRE IP:    $REMOTE_GRE_IP"
+  echo "    MTU:              $MTU_VAL"
   echo
 
-  read -rp "Do you want to change these private IPs manually? [y/N]: " custom_yn
+  # امکان شخصی‌سازی دستی آی‌پی‌های داخلی (اختیاری)
+  read -rp "Customize inner GRE IPs manually? [y/N]: " custom_yn
   if [[ "$custom_yn" =~ ^[Yy]$ ]]; then
     read -rp "Enter Local GRE IP with CIDR (e.g. ${BASE_NET}.1/30): " LOCAL_GRE_IP
     read -rp "Enter Remote GRE IP (e.g. ${BASE_NET}.2): " REMOTE_GRE_IP
   fi
-
-  read -rp "Tunnel MTU [Default: $DEFAULT_MTU]: " input_mtu
-  MTU_VAL="${input_mtu:-$DEFAULT_MTU}"
 
   create_tunnel 1 || echo "[-] Tunnel setup failed."
 }
@@ -580,53 +590,26 @@ manage_delete_tunnel() {
   esac
 }
 
-manage_remove_all() {
-  clear
-  echo "======================================"
-  echo "        Remove All Tunnels            "
-  echo "======================================"
-
-  collect_tunnel_records
-  if [ ${#TUNNEL_RECORDS[@]} -eq 0 ]; then
-    echo "[i] No tunnels are registered by this script."
-    return
-  fi
-
-  local cfg dev
-  for cfg in "${TUNNEL_RECORDS[@]}"; do
-    IFS='|' read -r dev _ < <(config_fields "$cfg")
-    echo "    - ${dev:-?}"
-  done
-  echo
-  read -rp "Remove ALL of the above tunnels? [y/N]: " confirm
-  case "$confirm" in
-    [Yy]*) ;;
-    *) echo "[i] Cancelled."; return ;;
-  esac
-
-  for cfg in "${TUNNEL_RECORDS[@]}"; do
-    delete_tunnel_record "$cfg"
-  done
-}
-
 menu_management() {
-  clear
-  echo "======================================"
-  echo "          Tunnel Management           "
-  echo "======================================"
-  echo "1) View status of all tunnels (4x ping each)"
-  echo "2) Delete a specific tunnel"
-  echo "3) Remove all registered tunnels"
-  echo "0) Back"
-  echo
-  read -rp "Select an option [0-3]: " mchoice
-  case "$mchoice" in
-    1) manage_view_status ;;
-    2) manage_delete_tunnel ;;
-    3) manage_remove_all ;;
-    0 | "") return ;;
-    *) echo "[-] Invalid option."; sleep 1 ;;
-  esac
+  while true; do
+    clear
+    echo "======================================"
+    echo "          Tunnel Management           "
+    echo "======================================"
+    echo "1) View status of all tunnels (4x ping each)"
+    echo "2) Delete a specific tunnel"
+    echo "0) Back"
+    echo
+    read -rp "Select an option [0-2]: " mchoice
+    case "$mchoice" in
+      1) manage_view_status ;;
+      2) manage_delete_tunnel ;;
+      0 | "") return ;;
+      *) echo "[-] Invalid option."; sleep 1; continue ;;
+    esac
+    echo
+    read -rp "Press Enter to continue..." _
+  done
 }
 
 install_service() {
@@ -670,11 +653,52 @@ EOF
   systemctl enable --now gre-tunnel.service
 
   if systemctl is-active --quiet gre-tunnel.service; then
-    echo "[✓] Service installed and started successfully: gre-tunnel.service"
+    echo "[✓] Service installed & enabled — tunnels will survive reboot."
   else
     echo "[-] Service installed but failed to start. Run: journalctl -xeu gre-tunnel.service"
     return 1
   fi
+}
+
+# نصب اسکریپت وضعیت تانل در بنر ورود SSH (MOTD) اوبونتو
+install_motd() {
+  local dir
+  dir="$(dirname "$MOTD_FILE")"
+  if [ ! -d "$dir" ]; then
+    echo "[i] $dir not found; skipping login banner setup."
+    return 0
+  fi
+
+  cat > "$MOTD_FILE" <<'EOF'
+#!/bin/bash
+# Auto-generated by gre.sh — shows GRE tunnel status at SSH login
+CONF_DIR="/etc/gre-tunnel.d"
+shown=0
+if [ -d "$CONF_DIR" ]; then
+  for cfg in "$CONF_DIR"/*.conf; do
+    [ -e "$cfg" ] || continue
+    unset TUNNEL_DEV SERVER_ROLE LOCAL_GRE_IP REMOTE_GRE_IP
+    # shellcheck disable=SC1090
+    . "$cfg" 2>/dev/null || continue
+    dev="${TUNNEL_DEV:-gre1}"
+    state=$(ip -brief link show "$dev" 2>/dev/null | awk '{print $2}')
+    [ -n "$state" ] || continue
+    if [ "$shown" -eq 0 ]; then
+      echo ""
+      echo "  GRE Tunnels:"
+      shown=1
+    fi
+    printf "   - %-6s [%-4s]  local %-18s remote %s\n" \
+      "$dev" "$state" "${LOCAL_GRE_IP:-?}" "${REMOTE_GRE_IP:-?}"
+  done
+  if [ "$shown" -eq 1 ]; then
+    echo ""
+  fi
+fi
+EOF
+
+  chmod +x "$MOTD_FILE" 2>/dev/null || true
+  echo "[✓] Login banner installed: $MOTD_FILE"
 }
 
 uninstall_service() {
@@ -684,24 +708,58 @@ uninstall_service() {
     systemctl daemon-reload
   fi
   rm -f "$INSTALL_BIN"
-  echo "[✓] Service uninstalled and binary removed."
+  rm -f "$MOTD_FILE"
+  echo "[✓] Service uninstalled, binary and login banner removed."
+}
+
+# شروع یک تانل ثبت‌شده در ساب‌شل (برای سرویس و منوی مدیریت)
+start_tunnel_from_config() {
+  local cfg=$1
+  (
+    set +u
+    # shellcheck disable=SC1090
+    source "$cfg" 2>/dev/null || true
+    TUNNEL_DEV="${TUNNEL_DEV:-$DEFAULT_TUNNEL_DEV}"
+    MTU_VAL="${MTU_VAL:-$DEFAULT_MTU}"
+    create_tunnel 0
+  )
 }
 
 service_start() {
-  if load_config; then
-    create_tunnel 0
-  else
-    echo "[-] No configuration found at $CONF_FILE" >&2
+  local started=0 cfg
+
+  while IFS= read -r cfg; do
+    [ -n "$cfg" ] || continue
+    started=1
+    start_tunnel_from_config "$cfg" || true
+  done < <(list_tunnel_records)
+
+  # سازگاری با کانفیگ قدیمی تک‌تانلی
+  if [ "$started" -eq 0 ] && [ -f "$CONF_FILE" ]; then
+    load_config && create_tunnel 0
+    started=1
+  fi
+
+  if [ "$started" -eq 0 ]; then
+    echo "[-] No configuration found at $CONF_DIR or $CONF_FILE" >&2
     return 1
   fi
 }
 
 service_stop() {
-  if load_config; then
-    stop_tunnel "$TUNNEL_DEV"
-  else
-    stop_tunnel "$DEFAULT_TUNNEL_DEV"
+  local cfg dev
+
+  while IFS= read -r cfg; do
+    [ -n "$cfg" ] || continue
+    IFS='|' read -r dev _ < <(config_fields "$cfg")
+    [ -n "$dev" ] && stop_tunnel "$dev"
+  done < <(list_tunnel_records)
+
+  if [ -f "$CONF_FILE" ]; then
+    load_config && stop_tunnel "$TUNNEL_DEV"
   fi
+
+  return 0
 }
 
 show_menu() {
@@ -711,6 +769,7 @@ show_menu() {
   echo "======================================"
   echo "      GRE Tunnel Management Tool      "
   echo "======================================"
+  echo "   Version:     v$VERSION"
   echo "   Server IPv4: ${server_ip:-Unknown}"
   echo "--------------------------------------"
   echo "1) Configure / Start Tunnel"
@@ -721,26 +780,34 @@ show_menu() {
   echo
   read -rp "Select an option [0-4]: " CHOICE
   case "$CHOICE" in
-    1) menu_config_tunnel ; read -rp "Press Enter to continue..." _ ;;
-    2) status_check ; read -rp "Press Enter to continue..." _ ;;
-    3) menu_management ; read -rp "Press Enter to continue..." _ ;;
-    4) remove_tun ; read -rp "Press Enter to continue..." _ ;;
+    1) menu_config_tunnel ;;
+    2) status_check ;;
+    3) menu_management ;;
+    4) remove_tun ;;
     0) echo "Exiting..."; exit 0 ;;
-    *) echo "[-] Invalid option."; sleep 1 ;;
+    *) echo "[-] Invalid option."; sleep 1; return ;;
   esac
+  echo
+  read -rp "Press Enter to continue..." _
 }
 
 # Entrypoint
-if [[ "${1:-}" == "--service" ]]; then
-  ensure_root
-  case "${2:-}" in
-    start) service_start; exit $? ;;
-    stop)  service_stop; exit $? ;;
-    *) echo "Usage: $0 --service {start|stop}" >&2; exit 1 ;;
-  esac
-fi
+case "${1:-}" in
+  --service)
+    ensure_root
+    case "${2:-}" in
+      start) service_start; exit $? ;;
+      stop)  service_stop; exit $? ;;
+      *) echo "Usage: $0 --service {start|stop}" >&2; exit 1 ;;
+    esac
+    ;;
+  --version | -v)
+    echo "gre.sh v$VERSION"
+    exit 0
+    ;;
+esac
 
 ensure_root
 while true; do
-  show_menu
+  show_menu || true
 done
