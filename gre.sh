@@ -52,6 +52,15 @@ detect_local_public_ip() {
   echo "$detected"
 }
 
+# آی‌پی سرور یک‌بار تشخیص داده و کش می‌شود تا منو سریع باز شود
+CACHED_SERVER_IPV4=""
+get_server_ipv4_cached() {
+  if [ -z "$CACHED_SERVER_IPV4" ]; then
+    CACHED_SERVER_IPV4=$(detect_local_public_ip)
+  fi
+  printf '%s' "$CACHED_SERVER_IPV4"
+}
+
 save_config() {
   cat > "$CONF_FILE" <<EOF
 ROLE="$ROLE"
@@ -448,9 +457,13 @@ service_stop() {
 
 show_menu() {
   clear
+  local server_ip
+  server_ip=$(get_server_ipv4_cached)
   echo "======================================"
   echo "      GRE Tunnel Management Tool      "
   echo "======================================"
+  echo "   Server IPv4: ${server_ip:-Unknown}"
+  echo "--------------------------------------"
   echo "1) Configure / Start Tunnel"
   echo "2) Check Tunnel Status"
   echo "3) Remove Tunnel & Clean"
