@@ -3,7 +3,7 @@
 # هر عملیات خطاپذیر خودش خطا را مدیریت می‌کند.
 set -o pipefail
 
-VERSION="2.3.0"
+VERSION="2.4.0"
 
 CONF_FILE="/etc/gre-tunnel.conf"
 CONF_DIR="/etc/gre-tunnel.d"
@@ -32,11 +32,17 @@ validate_ipv4() {
     return 1
   fi
   IFS='.' read -r -a octets <<< "$ip"
+  local octet
   for octet in "${octets[@]}"; do
-    if ((octet < 0 || octet > 255)); then
+    # 10# باعث می‌شود عدد با صفر ابتدایی هم اعشاری تفسیر شود (نه اکتال)
+    if ((10#$octet > 255)); then
       return 1
     fi
   done
+  # رد کردن آدرس‌های رزرو/نامعتبر برای سمت عمومی
+  if [ "$ip" = "0.0.0.0" ] || [ "$ip" = "255.255.255.255" ]; then
+    return 1
+  fi
   return 0
 }
 
@@ -48,10 +54,30 @@ validate_cidr_ipv4() {
   if [[ "$ip" == "$cidr" || -z "$prefix" || ! "$prefix" =~ ^[0-9]+$ ]]; then
     return 1
   fi
-  if ((prefix < 8 || prefix > 32)); then
+  if ((10#$prefix < 8 || 10#$prefix > 32)); then
     return 1
   fi
   validate_ipv4 "$ip"
+}
+
+# نام اینترفیس: فقط حروف/عدد/نقطه/خط‌تیره، حداکثر ۱۵ کاراکتر (محدودیت کرنل)
+validate_dev_name() {
+  local dev=$1
+  [ -n "$dev" ] || return 1
+  [[ "$dev" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,14}$ ]] || return 1
+  case "$dev" in
+    .* | *..*) return 1 ;;
+  esac
+  return 0
+}
+
+# MTU معتبر: عددی و در بازه‌ی منطقی
+validate_mtu() {
+  local mtu=$1
+  [ -n "$mtu" ] || return 1
+  [[ "$mtu" =~ ^[0-9]+$ ]] || return 1
+  ((10#$mtu >= 576 && 10#$mtu <= 65535)) || return 1
+  return 0
 }
 
 detect_local_public_ip() {
@@ -81,18 +107,20 @@ next_tunnel_dev() {
   echo "gre$i"
 }
 
+# نوشتن امن کانفیگ: با %q مقادیر escape می‌شوند تا هنگام source شدن
+# هیچ دستور دلخواهی اجرا نشود (جلوگیری از command injection)
 write_config_block() {
   local file=$1
-  cat > "$file" <<EOF
-ROLE="$ROLE"
-SERVER_ROLE="$SERVER_ROLE"
-TUNNEL_DEV="$TUNNEL_DEV"
-LOCAL_PUBLIC_IP="$LOCAL_PUBLIC_IP"
-REMOTE_PUBLIC_IP="$REMOTE_PUBLIC_IP"
-LOCAL_GRE_IP="$LOCAL_GRE_IP"
-REMOTE_GRE_IP="$REMOTE_GRE_IP"
-MTU_VAL="$MTU_VAL"
-EOF
+  {
+    printf 'ROLE=%q\n' "${ROLE:-}"
+    printf 'SERVER_ROLE=%q\n' "${SERVER_ROLE:-}"
+    printf 'TUNNEL_DEV=%q\n' "${TUNNEL_DEV:-}"
+    printf 'LOCAL_PUBLIC_IP=%q\n' "${LOCAL_PUBLIC_IP:-}"
+    printf 'REMOTE_PUBLIC_IP=%q\n' "${REMOTE_PUBLIC_IP:-}"
+    printf 'LOCAL_GRE_IP=%q\n' "${LOCAL_GRE_IP:-}"
+    printf 'REMOTE_GRE_IP=%q\n' "${REMOTE_GRE_IP:-}"
+    printf 'MTU_VAL=%q\n' "${MTU_VAL:-}"
+  } > "$file"
   chmod 600 "$file"
 }
 
@@ -175,6 +203,14 @@ remove_firewall_rules() {
   fi
 }
 
+# حذف قوانین عمومی GRE (INPUT/OUTPUT) — فقط هنگام حذف کامل استفاده می‌شود
+remove_global_firewall_rules() {
+  if command -v iptables >/dev/null 2>&1; then
+    while iptables -D INPUT -p gre -j ACCEPT 2>/dev/null; do :; done
+    while iptables -D OUTPUT -p gre -j ACCEPT 2>/dev/null; do :; done
+  fi
+}
+
 create_tunnel() {
   local interactive=${1:-0}
   if [ "$interactive" -eq 1 ]; then
@@ -195,6 +231,21 @@ create_tunnel() {
     return 1
   fi
 
+  if ! validate_dev_name "$TUNNEL_DEV"; then
+    echo "[-] Invalid tunnel interface name: '$TUNNEL_DEV'" >&2
+    return 1
+  fi
+
+  if ! validate_cidr_ipv4 "$LOCAL_GRE_IP"; then
+    echo "[-] Invalid local tunnel IP/CIDR: '$LOCAL_GRE_IP'" >&2
+    return 1
+  fi
+
+  if ! validate_mtu "$MTU_VAL"; then
+    echo "[-] Invalid MTU: '$MTU_VAL'" >&2
+    return 1
+  fi
+
   echo "=========================================="
   echo "[*] Role:             ${SERVER_ROLE:-Custom}"
   echo "[*] Tunnel Interface: $TUNNEL_DEV"
@@ -212,10 +263,23 @@ create_tunnel() {
   ip tunnel del "$TUNNEL_DEV" 2>/dev/null || true
 
   # ساخت تانل
-  ip tunnel add "$TUNNEL_DEV" mode gre local "$LOCAL_PUBLIC_IP" remote "$REMOTE_PUBLIC_IP" ttl 255
-  ip addr add "$LOCAL_GRE_IP" dev "$TUNNEL_DEV"
-  ip link set "$TUNNEL_DEV" mtu "$MTU_VAL"
-  ip link set "$TUNNEL_DEV" up
+  if ! ip tunnel add "$TUNNEL_DEV" mode gre local "$LOCAL_PUBLIC_IP" remote "$REMOTE_PUBLIC_IP" ttl 255; then
+    echo "[-] Failed to create GRE interface '$TUNNEL_DEV'." >&2
+    return 1
+  fi
+
+  if ! ip addr add "$LOCAL_GRE_IP" dev "$TUNNEL_DEV" 2>/dev/null; then
+    echo "[-] Failed to assign address '$LOCAL_GRE_IP' to '$TUNNEL_DEV'." >&2
+    ip tunnel del "$TUNNEL_DEV" 2>/dev/null || true
+    return 1
+  fi
+
+  ip link set "$TUNNEL_DEV" mtu "$MTU_VAL" 2>/dev/null || true
+
+  if ! ip link set "$TUNNEL_DEV" up; then
+    echo "[-] Failed to bring up interface '$TUNNEL_DEV'." >&2
+    return 1
+  fi
 
   if ! ip link show "$TUNNEL_DEV" >/dev/null 2>&1; then
     echo "[-] GRE interface creation failed." >&2
@@ -279,6 +343,10 @@ menu_config_tunnel() {
   default_dev="$(next_tunnel_dev)"
   read -rp "Interface name [Default: $default_dev]: " input_dev
   TUNNEL_DEV="${input_dev:-$default_dev}"
+  if ! validate_dev_name "$TUNNEL_DEV"; then
+    echo "[-] Invalid interface name. Allowed: letters, digits, '_', '.', '-' (max 15)."
+    return
+  fi
 
   # آی‌پی‌های داخلی تانل: کاربر کامل با CIDR وارد می‌کند
   local default_local default_remote
@@ -307,6 +375,10 @@ menu_config_tunnel() {
 
   read -rp "Tunnel MTU [Default: $DEFAULT_MTU]: " input_mtu
   MTU_VAL="${input_mtu:-$DEFAULT_MTU}"
+  if ! validate_mtu "$MTU_VAL"; then
+    echo "[-] Invalid MTU. Enter a number between 576 and 65535."
+    return
+  fi
 
   echo
   echo "[✓] Summary for $SERVER_ROLE:"
@@ -578,8 +650,13 @@ install_service() {
   fi
 
   mkdir -p "$(dirname "$INSTALL_BIN")"
-  cp -f -- "$script_source" "$INSTALL_BIN"
-  chmod 755 "$INSTALL_BIN"
+  if [ "$script_source" != "$INSTALL_BIN" ]; then
+    cp -f -- "$script_source" "$INSTALL_BIN" || {
+      echo "[-] Failed to copy script to $INSTALL_BIN." >&2
+      return 1
+    }
+  fi
+  chmod 755 "$INSTALL_BIN" 2>/dev/null || true
 
   cat > "$SERVICE_UNIT" <<EOF
 [Unit]
@@ -798,6 +875,7 @@ uninstall_service() {
     rm -f "$SERVICE_UNIT"
     systemctl daemon-reload
   fi
+  remove_global_firewall_rules
   rm -f "$INSTALL_BIN"
   rm -f "$MOTD_HELPER" 2>/dev/null || true
   rm -f "$MOTD_LEGACY" 2>/dev/null || true
