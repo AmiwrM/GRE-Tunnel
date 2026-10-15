@@ -2,6 +2,7 @@
 set -euo pipefail
 
 CONF_FILE="/etc/gre-tunnel.conf"
+CONF_DIR="/etc/gre-tunnel.d"
 INSTALL_BIN="/usr/local/bin/gre.sh"
 SERVICE_UNIT="/etc/systemd/system/gre-tunnel.service"
 DEFAULT_TUNNEL_DEV="gre1"
@@ -61,8 +62,9 @@ get_server_ipv4_cached() {
   printf '%s' "$CACHED_SERVER_IPV4"
 }
 
-save_config() {
-  cat > "$CONF_FILE" <<EOF
+write_config_block() {
+  local file=$1
+  cat > "$file" <<EOF
 ROLE="$ROLE"
 SERVER_ROLE="$SERVER_ROLE"
 TUNNEL_DEV="$TUNNEL_DEV"
@@ -72,7 +74,23 @@ LOCAL_GRE_IP="$LOCAL_GRE_IP"
 REMOTE_GRE_IP="$REMOTE_GRE_IP"
 MTU_VAL="$MTU_VAL"
 EOF
-  chmod 600 "$CONF_FILE"
+  chmod 600 "$file"
+}
+
+# ثبت تانل در پوشه‌ی مدیریت تا در منوی Management قابل مشاهده/حذف باشد
+save_tunnel_record() {
+  local quiet=${1:-0}
+  mkdir -p "$CONF_DIR"
+  local target="$CONF_DIR/${TUNNEL_DEV}.conf"
+  write_config_block "$target"
+  if [ "$quiet" -ne 1 ]; then
+    echo "[✓] Tunnel '$TUNNEL_DEV' registered for management: $target"
+  fi
+}
+
+save_config() {
+  save_tunnel_record 1
+  write_config_block "$CONF_FILE"
   echo "[✓] Configuration saved to $CONF_FILE"
 }
 
@@ -85,6 +103,29 @@ load_config() {
     return 0
   fi
   return 1
+}
+
+# خواندن فیلدهای یک فایل کانفیگ به صورت رشته‌ی جدا شده با |
+# خروجی: dev|role|local_pub|remote_pub|local_gre|remote_gre|mtu
+config_fields() {
+  local cfg=$1
+  (
+    set +u
+    # shellcheck disable=SC1090
+    source "$cfg" 2>/dev/null || true
+    printf '%s|%s|%s|%s|%s|%s|%s' \
+      "${TUNNEL_DEV:-}" "${SERVER_ROLE:-}" "${LOCAL_PUBLIC_IP:-}" \
+      "${REMOTE_PUBLIC_IP:-}" "${LOCAL_GRE_IP:-}" "${REMOTE_GRE_IP:-}" "${MTU_VAL:-}"
+  )
+}
+
+# فهرست فایل‌های کانفیگ تانل‌های ثبت‌شده (هر خط یک مسیر)
+list_tunnel_records() {
+  local cfg
+  for cfg in "$CONF_DIR"/*.conf; do
+    [ -e "$cfg" ] || continue
+    printf '%s\n' "$cfg"
+  done
 }
 
 apply_firewall_and_sysctl() {
@@ -166,6 +207,9 @@ create_tunnel() {
 
   echo
   echo "[✓] GRE tunnel interface ($TUNNEL_DEV) is successfully UP!"
+
+  # ثبت خودکار تانل ساخته‌شده برای منوی Management
+  save_tunnel_record 1
 
   if [ "$interactive" -eq 1 ]; then
     echo
@@ -367,7 +411,12 @@ remove_tun() {
   echo
   read -rp "Remove saved configuration ($CONF_FILE)? [y/N]: " yn
   case "$yn" in
-    [Yy]*) rm -f "$CONF_FILE"; echo "[✓] Config removed." ;;
+    [Yy]*)
+      rm -f "$CONF_FILE"
+      rm -f "$CONF_DIR"/*.conf 2>/dev/null || true
+      rmdir "$CONF_DIR" 2>/dev/null || true
+      echo "[✓] Config removed."
+      ;;
     *) echo "[i] Config retained." ;;
   esac
 
@@ -378,6 +427,206 @@ remove_tun() {
       *) echo "[i] Service kept." ;;
     esac
   fi
+}
+
+# ------------------------------------------------------------------
+#  منوی Management: مدیریت تمام تانل‌های ثبت‌شده توسط این اسکریپت
+# ------------------------------------------------------------------
+
+# نمایش وضعیت یک تانل به همراه ۴ درخواست پینگ بین آی‌پی‌های تانل
+show_tunnel_status_from_config() {
+  local cfg=$1
+  local dev role lpub rpub lgre rgre mtu
+  IFS='|' read -r dev role lpub rpub lgre rgre mtu < <(config_fields "$cfg")
+  dev="${dev:-$DEFAULT_TUNNEL_DEV}"
+
+  echo "--------------------------------------"
+  echo "[*] Tunnel Interface: ${dev}"
+  echo "    Role:              ${role:-Custom}"
+  echo "    Config:            $cfg"
+  echo "    Local Public IP:   ${lpub:-N/A}"
+  echo "    Remote Public IP:  ${rpub:-N/A}"
+  echo "    Local GRE IP:      ${lgre:-N/A}"
+  echo "    Remote GRE IP:     ${rgre:-N/A}"
+
+  if ip link show "$dev" >/dev/null 2>&1; then
+    local link_state local_addr
+    link_state=$(ip -brief link show "$dev" | awk '{print $2}')
+    local_addr=$(ip -brief addr show "$dev" | awk '{print $3}')
+    echo "    Link State:        ${link_state:-UNKNOWN}"
+    echo "    Assigned Address:  ${local_addr:-Not set}"
+  else
+    echo "    Link State:        DOWN (interface missing) [✗]"
+  fi
+
+  # پینگ به آی‌پی داخلی تانل سمت مقابل - ۴ درخواست
+  local target="${rgre%/}"
+  if [ -z "$target" ]; then
+    echo "    Ping Test:         skipped (remote GRE IP unknown)"
+    return
+  fi
+
+  echo "    Ping Test -> $target (4 requests):"
+  local result
+  result=$(ping -c 4 -W 2 "$target" 2>&1 || true)
+  if echo "$result" | grep -qE '[1-9][0-9]* (packets )?received'; then
+    local rtt
+    rtt=$(echo "$result" | awk -F'/' '/rtt|round-trip/ {print $5}')
+    echo "      -> Tunnel Link is ACTIVE [✓] (avg latency: ~${rtt:-?} ms)"
+  else
+    echo "      -> Tunnel Link is DOWN / NOT RESPONDING [✗]"
+  fi
+}
+
+# ساخت آرایه‌ای از مسیر کانفیگ تانل‌های ثبت‌شده
+collect_tunnel_records() {
+  local line
+  TUNNEL_RECORDS=()
+  while IFS= read -r line; do
+    if [ -n "$line" ]; then
+      TUNNEL_RECORDS+=("$line")
+    fi
+  done < <(list_tunnel_records)
+
+  # سازگاری با کانفیگ قدیمی (تک‌تانلی) که در پوشه‌ی مدیریت ثبت نشده است
+  if [ ${#TUNNEL_RECORDS[@]} -eq 0 ] && [ -f "$CONF_FILE" ]; then
+    TUNNEL_RECORDS+=("$CONF_FILE")
+  fi
+}
+
+manage_view_status() {
+  clear
+  echo "======================================"
+  echo "        All Tunnels Status            "
+  echo "======================================"
+
+  collect_tunnel_records
+  if [ ${#TUNNEL_RECORDS[@]} -eq 0 ]; then
+    echo "[i] No tunnels are registered by this script."
+    return
+  fi
+
+  local cfg
+  for cfg in "${TUNNEL_RECORDS[@]}"; do
+    show_tunnel_status_from_config "$cfg"
+    echo
+  done
+}
+
+# حذف یک تانل (اینترفیس + رکورد کانفیگ)
+delete_tunnel_record() {
+  local cfg=$1
+  local dev
+  IFS='|' read -r dev _ < <(config_fields "$cfg")
+  dev="${dev:-$DEFAULT_TUNNEL_DEV}"
+
+  echo "[*] Stopping and removing tunnel '$dev'..."
+  stop_tunnel "$dev"
+  rm -f "$cfg"
+
+  # اگر کانفیگ اصلی (legacy) مربوط به همین تانل بود، آن را هم پاک کن
+  if [ -f "$CONF_FILE" ]; then
+    local legacy_dev
+    IFS='|' read -r legacy_dev _ < <(config_fields "$CONF_FILE")
+    if [ "$legacy_dev" = "$dev" ]; then
+      rm -f "$CONF_FILE"
+      echo "[i] Legacy config removed: $CONF_FILE"
+    fi
+  fi
+
+  echo "[✓] Tunnel '$dev' removed."
+}
+
+manage_delete_tunnel() {
+  clear
+  echo "======================================"
+  echo "          Delete a Tunnel             "
+  echo "======================================"
+
+  collect_tunnel_records
+  if [ ${#TUNNEL_RECORDS[@]} -eq 0 ]; then
+    echo "[i] No tunnels are registered by this script."
+    return
+  fi
+
+  local i=1 cfg dev
+  for cfg in "${TUNNEL_RECORDS[@]}"; do
+    IFS='|' read -r dev _ < <(config_fields "$cfg")
+    printf '%s) %-12s (%s)\n' "$i" "${dev:-?}" "$cfg"
+    i=$((i + 1))
+  done
+  echo "0) Back"
+  echo
+
+  local sel
+  read -rp "Select tunnel number to delete: " sel
+  case "$sel" in
+    0 | "") return ;;
+  esac
+
+  if ! [[ "$sel" =~ ^[0-9]+$ ]] || ((sel < 1 || sel > ${#TUNNEL_RECORDS[@]})); then
+    echo "[-] Invalid selection."
+    return
+  fi
+
+  local target="${TUNNEL_RECORDS[$((sel - 1))]}"
+  IFS='|' read -r dev _ < <(config_fields "$target")
+
+  local confirm
+  read -rp "Delete tunnel '$dev' and its config? [y/N]: " confirm
+  case "$confirm" in
+    [Yy]*) delete_tunnel_record "$target" ;;
+    *) echo "[i] Cancelled." ;;
+  esac
+}
+
+manage_remove_all() {
+  clear
+  echo "======================================"
+  echo "        Remove All Tunnels            "
+  echo "======================================"
+
+  collect_tunnel_records
+  if [ ${#TUNNEL_RECORDS[@]} -eq 0 ]; then
+    echo "[i] No tunnels are registered by this script."
+    return
+  fi
+
+  local cfg dev
+  for cfg in "${TUNNEL_RECORDS[@]}"; do
+    IFS='|' read -r dev _ < <(config_fields "$cfg")
+    echo "    - ${dev:-?}"
+  done
+  echo
+  read -rp "Remove ALL of the above tunnels? [y/N]: " confirm
+  case "$confirm" in
+    [Yy]*) ;;
+    *) echo "[i] Cancelled."; return ;;
+  esac
+
+  for cfg in "${TUNNEL_RECORDS[@]}"; do
+    delete_tunnel_record "$cfg"
+  done
+}
+
+menu_management() {
+  clear
+  echo "======================================"
+  echo "          Tunnel Management           "
+  echo "======================================"
+  echo "1) View status of all tunnels (4x ping each)"
+  echo "2) Delete a specific tunnel"
+  echo "3) Remove all registered tunnels"
+  echo "0) Back"
+  echo
+  read -rp "Select an option [0-3]: " mchoice
+  case "$mchoice" in
+    1) manage_view_status ;;
+    2) manage_delete_tunnel ;;
+    3) manage_remove_all ;;
+    0 | "") return ;;
+    *) echo "[-] Invalid option."; sleep 1 ;;
+  esac
 }
 
 install_service() {
@@ -466,14 +715,16 @@ show_menu() {
   echo "--------------------------------------"
   echo "1) Configure / Start Tunnel"
   echo "2) Check Tunnel Status"
-  echo "3) Remove Tunnel & Clean"
+  echo "3) Management (all tunnels)"
+  echo "4) Remove Tunnel & Clean"
   echo "0) Exit"
   echo
-  read -rp "Select an option [0-3]: " CHOICE
+  read -rp "Select an option [0-4]: " CHOICE
   case "$CHOICE" in
     1) menu_config_tunnel ; read -rp "Press Enter to continue..." _ ;;
     2) status_check ; read -rp "Press Enter to continue..." _ ;;
-    3) remove_tun ; read -rp "Press Enter to continue..." _ ;;
+    3) menu_management ; read -rp "Press Enter to continue..." _ ;;
+    4) remove_tun ; read -rp "Press Enter to continue..." _ ;;
     0) echo "Exiting..."; exit 0 ;;
     *) echo "[-] Invalid option."; sleep 1 ;;
   esac
