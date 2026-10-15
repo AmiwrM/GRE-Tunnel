@@ -3,13 +3,17 @@
 # هر عملیات خطاپذیر خودش خطا را مدیریت می‌کند.
 set -o pipefail
 
-VERSION="2.0.0"
+VERSION="2.1.0"
 
 CONF_FILE="/etc/gre-tunnel.conf"
 CONF_DIR="/etc/gre-tunnel.d"
 INSTALL_BIN="/usr/local/bin/gre.sh"
 SERVICE_UNIT="/etc/systemd/system/gre-tunnel.service"
-MOTD_FILE="/etc/update-motd.d/99-gre-tunnel"
+# بنر ورود SSH: خطوط آی‌پی تانل داخل بلوک «System information» (landscape) تزریق می‌شوند
+MOTD_FILE="/etc/update-motd.d/50-landscape-sysinfo"
+MOTD_ORIG="/etc/update-motd.d/50-landscape-sysinfo.gre-orig"
+MOTD_HELPER="/usr/local/bin/gre-motd-ip-lines"
+MOTD_LEGACY="/etc/update-motd.d/99-gre-tunnel"
 DEFAULT_TUNNEL_DEV="gre1"
 DEFAULT_MTU="1390"
 
@@ -253,14 +257,13 @@ menu_config_tunnel() {
     *) echo "[-] Invalid selection."; return ;;
   esac
 
-  # کمترین ورودی الزامی: آی‌پی عمومی سمت مقابل
+  echo
   read -rp "Remote (peer) Public IPv4: " REMOTE_PUBLIC_IP
   if ! validate_ipv4 "$REMOTE_PUBLIC_IP"; then
     echo "[-] Invalid Remote Public IPv4."
     return
   fi
 
-  # آی‌پی عمومی این سرور به صورت خودکار تشخیص داده می‌شود
   local detected_ip
   detected_ip=$(detect_local_public_ip)
   read -rp "This server's Public IPv4 [Detected: ${detected_ip:-None}]: " input_local_ip
@@ -270,126 +273,51 @@ menu_config_tunnel() {
     return
   fi
 
-  # مقادیر پیش‌فرض (در حالت عادی نیازی به تغییر ندارند)
-  TUNNEL_DEV="$(next_tunnel_dev)"
-  BASE_NET="10.10.10"
-  MTU_VAL="$DEFAULT_MTU"
+  echo
+  local default_dev
+  default_dev="$(next_tunnel_dev)"
+  read -rp "Interface name [Default: $default_dev]: " input_dev
+  TUNNEL_DEV="${input_dev:-$default_dev}"
+
+  # آی‌پی‌های داخلی تانل: کاربر کامل با CIDR وارد می‌کند
+  local default_local default_remote
+  if [ "$ROLE" == "1" ]; then
+    default_local="10.10.10.1/24"
+    default_remote="10.10.10.2/24"
+  else
+    default_local="10.10.10.2/24"
+    default_remote="10.10.10.1/24"
+  fi
 
   echo
-  read -rp "Use advanced settings (interface / subnet / MTU)? [y/N]: " adv_yn
-  if [[ "$adv_yn" =~ ^[Yy]$ ]]; then
-    local input_dev input_prefix input_mtu
-    read -rp "Interface name [Default: $TUNNEL_DEV]: " input_dev
-    TUNNEL_DEV="${input_dev:-$TUNNEL_DEV}"
-
-    echo "Subnet base sets the two inner tunnel IPs automatically:"
-    echo "  - Iran Server:   <base>.1/30 (Local) | <base>.2 (Remote)"
-    echo "  - Kharej Server: <base>.2/30 (Local) | <base>.1 (Remote)"
-    read -rp "Tunnel Subnet base (e.g. 10.10.30) [Default: $BASE_NET]: " input_prefix
-    input_prefix="${input_prefix:-$BASE_NET}"
-    if [[ "$input_prefix" =~ ^([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}) ]]; then
-      BASE_NET="${BASH_REMATCH[1]}"
-    else
-      echo "[-] Invalid subnet format! Using default: $BASE_NET"
-    fi
-
-    read -rp "Tunnel MTU [Default: $DEFAULT_MTU]: " input_mtu
-    MTU_VAL="${input_mtu:-$DEFAULT_MTU}"
+  read -rp "Local Tunnel IP (this server) [Default: $default_local]: " input_local_gre
+  LOCAL_GRE_IP="${input_local_gre:-$default_local}"
+  if ! validate_cidr_ipv4 "$LOCAL_GRE_IP"; then
+    echo "[-] Invalid Local Tunnel IP. Use IP/CIDR format, e.g. $default_local"
+    return
   fi
 
-  # انتساب خودکار آی‌پی‌های داخلی تانل بر اساس نقش سرور
-  if [ "$ROLE" == "1" ]; then
-    LOCAL_GRE_IP="${BASE_NET}.1/30"
-    REMOTE_GRE_IP="${BASE_NET}.2"
-  else
-    LOCAL_GRE_IP="${BASE_NET}.2/30"
-    REMOTE_GRE_IP="${BASE_NET}.1"
+  read -rp "Remote Tunnel IP (peer) [Default: $default_remote]: " input_remote_gre
+  REMOTE_GRE_IP="${input_remote_gre:-$default_remote}"
+  if ! validate_cidr_ipv4 "$REMOTE_GRE_IP"; then
+    echo "[-] Invalid Remote Tunnel IP. Use IP/CIDR format, e.g. $default_remote"
+    return
   fi
+
+  read -rp "Tunnel MTU [Default: $DEFAULT_MTU]: " input_mtu
+  MTU_VAL="${input_mtu:-$DEFAULT_MTU}"
 
   echo
   echo "[✓] Summary for $SERVER_ROLE:"
   echo "    Interface:        $TUNNEL_DEV"
   echo "    Local Public IP:  $LOCAL_PUBLIC_IP"
   echo "    Remote Public IP: $REMOTE_PUBLIC_IP"
-  echo "    Local GRE IP:     $LOCAL_GRE_IP"
-  echo "    Remote GRE IP:    $REMOTE_GRE_IP"
+  echo "    Local Tunnel IP:  $LOCAL_GRE_IP"
+  echo "    Remote Tunnel IP: $REMOTE_GRE_IP"
   echo "    MTU:              $MTU_VAL"
   echo
 
-  # امکان شخصی‌سازی دستی آی‌پی‌های داخلی (اختیاری)
-  read -rp "Customize inner GRE IPs manually? [y/N]: " custom_yn
-  if [[ "$custom_yn" =~ ^[Yy]$ ]]; then
-    read -rp "Enter Local GRE IP with CIDR (e.g. ${BASE_NET}.1/30): " LOCAL_GRE_IP
-    read -rp "Enter Remote GRE IP (e.g. ${BASE_NET}.2): " REMOTE_GRE_IP
-  fi
-
   create_tunnel 1 || echo "[-] Tunnel setup failed."
-}
-
-status_check() {
-  clear
-  echo "======================================"
-  echo "          GRE Tunnel Status           "
-  echo "======================================"
-
-  local dev="$DEFAULT_TUNNEL_DEV"
-  if load_config; then
-    dev="$TUNNEL_DEV"
-  fi
-
-  if ! ip link show "$dev" >/dev/null 2>&1; then
-    echo "[-] Interface '$dev' does not exist."
-    return
-  fi
-
-  local link_state
-  link_state=$(ip -brief link show "$dev" | awk '{print $2}')
-  local local_addr
-  local_addr=$(ip -brief addr show "$dev" | awk '{print $3}')
-
-  echo "[i] Interface:      $dev"
-  echo "[i] Link State:     $link_state"
-  echo "[i] Tunnel Local:   ${local_addr:-Not set}"
-
-  local tun_info
-  tun_info=$(ip tunnel show "$dev" 2>/dev/null || true)
-  local remote_pub
-  remote_pub=$(echo "$tun_info" | awk -F'remote ' '{print $2}' | awk '{print $1}')
-  echo "[i] Remote Pub IP:  ${remote_pub:-N/A}"
-
-  echo "--------------------------------------"
-  if [ -n "$remote_pub" ]; then
-    echo "[*] Pinging Remote Public IP ($remote_pub)..."
-    if ping -c 2 -W 1 "$remote_pub" >/dev/null 2>&1; then
-      echo "    -> Remote Public IP is REACHABLE [✓]"
-    else
-      echo "    -> Remote Public IP is UNREACHABLE [✗]"
-    fi
-  fi
-
-  local target_inner="${REMOTE_GRE_IP:-}"
-  if [ -z "$target_inner" ] && load_config; then
-    target_inner="$REMOTE_GRE_IP"
-  fi
-
-  if [ -n "$target_inner" ]; then
-    echo "[*] Pinging Tunnel Remote IP ($target_inner)..."
-    local ping_result
-    ping_result=$(ping -c 3 -W 2 "$target_inner" 2>&1 || true)
-    if echo "$ping_result" | grep -qE '([1-9]) (packets )?received'; then
-      local rtt
-      rtt=$(echo "$ping_result" | awk -F'/' 'END{print $5}')
-      echo "    -> Tunnel Link is ACTIVE [✓] (Latency: ~${rtt:-?} ms)"
-    else
-      echo "    -> Tunnel Link is DOWN / NOT RESPONDING [✗]"
-    fi
-  else
-    echo "[i] Remote inner IP not loaded. Save configuration to test tunnel ping."
-  fi
-
-  echo "--------------------------------------"
-  echo "[*] Interface Traffic Stats:"
-  ip -s link show "$dev" | grep -E 'RX:|TX:|[0-9]+ +[0-9]+ +[0-9]+'
 }
 
 stop_tunnel() {
@@ -504,25 +432,6 @@ collect_tunnel_records() {
   fi
 }
 
-manage_view_status() {
-  clear
-  echo "======================================"
-  echo "        All Tunnels Status            "
-  echo "======================================"
-
-  collect_tunnel_records
-  if [ ${#TUNNEL_RECORDS[@]} -eq 0 ]; then
-    echo "[i] No tunnels are registered by this script."
-    return
-  fi
-
-  local cfg
-  for cfg in "${TUNNEL_RECORDS[@]}"; do
-    show_tunnel_status_from_config "$cfg"
-    echo
-  done
-}
-
 # حذف یک تانل (اینترفیس + رکورد کانفیگ)
 delete_tunnel_record() {
   local cfg=$1
@@ -547,68 +456,82 @@ delete_tunnel_record() {
   echo "[✓] Tunnel '$dev' removed."
 }
 
-manage_delete_tunnel() {
-  clear
-  echo "======================================"
-  echo "          Delete a Tunnel             "
-  echo "======================================"
+# منوی یک تانل خاص: نمایش محتویات + عملیات
+tunnel_actions_menu() {
+  local cfg=$1
+  local dev
+  IFS='|' read -r dev _ < <(config_fields "$cfg")
+  dev="${dev:-?}"
 
-  collect_tunnel_records
-  if [ ${#TUNNEL_RECORDS[@]} -eq 0 ]; then
-    echo "[i] No tunnels are registered by this script."
-    return
-  fi
-
-  local i=1 cfg dev
-  for cfg in "${TUNNEL_RECORDS[@]}"; do
-    IFS='|' read -r dev _ < <(config_fields "$cfg")
-    printf '%s) %-12s (%s)\n' "$i" "${dev:-?}" "$cfg"
-    i=$((i + 1))
-  done
-  echo "0) Back"
-  echo
-
-  local sel
-  read -rp "Select tunnel number to delete: " sel
-  case "$sel" in
-    0 | "") return ;;
-  esac
-
-  if ! [[ "$sel" =~ ^[0-9]+$ ]] || ((sel < 1 || sel > ${#TUNNEL_RECORDS[@]})); then
-    echo "[-] Invalid selection."
-    return
-  fi
-
-  local target="${TUNNEL_RECORDS[$((sel - 1))]}"
-  IFS='|' read -r dev _ < <(config_fields "$target")
-
-  local confirm
-  read -rp "Delete tunnel '$dev' and its config? [y/N]: " confirm
-  case "$confirm" in
-    [Yy]*) delete_tunnel_record "$target" ;;
-    *) echo "[i] Cancelled." ;;
-  esac
-}
-
-menu_management() {
   while true; do
     clear
     echo "======================================"
-    echo "          Tunnel Management           "
+    echo "             Tunnel: $dev"
     echo "======================================"
-    echo "1) View status of all tunnels (4x ping each)"
-    echo "2) Delete a specific tunnel"
+    show_tunnel_status_from_config "$cfg"
+    echo
+    echo "1) Restart this tunnel"
+    echo "2) Delete this tunnel"
     echo "0) Back"
     echo
-    read -rp "Select an option [0-2]: " mchoice
-    case "$mchoice" in
-      1) manage_view_status ;;
-      2) manage_delete_tunnel ;;
+    read -rp "Select an option [0-2]: " tchoice
+    case "$tchoice" in
+      1)
+        echo
+        echo "[*] Restarting tunnel '$dev'..."
+        start_tunnel_from_config "$cfg"
+        ;;
+      2)
+        local confirm
+        read -rp "Delete tunnel '$dev' and its config? [y/N]: " confirm
+        case "$confirm" in
+          [Yy]*) delete_tunnel_record "$cfg"; return ;;
+          *) echo "[i] Cancelled." ;;
+        esac
+        ;;
       0 | "") return ;;
       *) echo "[-] Invalid option."; sleep 1; continue ;;
     esac
     echo
     read -rp "Press Enter to continue..." _
+  done
+}
+
+# منوی انتخاب اینترفیس (تانل‌ها با نام اینترفیس منو می‌شوند)
+select_tunnel_menu() {
+  while true; do
+    clear
+    echo "======================================"
+    echo "                Tunnels               "
+    echo "======================================"
+
+    collect_tunnel_records
+    if [ ${#TUNNEL_RECORDS[@]} -eq 0 ]; then
+      echo "[i] No tunnels are registered by this script."
+      return
+    fi
+
+    local i=1 cfg dev
+    for cfg in "${TUNNEL_RECORDS[@]}"; do
+      IFS='|' read -r dev _ < <(config_fields "$cfg")
+      printf '%s) %s\n' "$i" "${dev:-?}"
+      i=$((i + 1))
+    done
+    echo "0) Back"
+    echo
+
+    local sel
+    read -rp "Select a tunnel [0-$((i - 1))]: " sel
+    case "$sel" in
+      0 | "") return ;;
+    esac
+    if ! [[ "$sel" =~ ^[0-9]+$ ]] || ((sel < 1 || sel > ${#TUNNEL_RECORDS[@]})); then
+      echo "[-] Invalid selection."
+      sleep 1
+      continue
+    fi
+
+    tunnel_actions_menu "${TUNNEL_RECORDS[$((sel - 1))]}"
   done
 }
 
@@ -660,7 +583,7 @@ EOF
   fi
 }
 
-# نصب اسکریپت وضعیت تانل در بنر ورود SSH (MOTD) اوبونتو
+# نصب بنر ورود SSH: خطوط آی‌پی تانل داخل بلوک «System information» تزریق می‌شوند
 install_motd() {
   local dir
   dir="$(dirname "$MOTD_FILE")"
@@ -669,36 +592,102 @@ install_motd() {
     return 0
   fi
 
-  cat > "$MOTD_FILE" <<'EOF'
-#!/bin/bash
-# Auto-generated by gre.sh — shows GRE tunnel status at SSH login
-CONF_DIR="/etc/gre-tunnel.d"
-shown=0
-if [ -d "$CONF_DIR" ]; then
-  for cfg in "$CONF_DIR"/*.conf; do
-    [ -e "$cfg" ] || continue
-    unset TUNNEL_DEV SERVER_ROLE LOCAL_GRE_IP REMOTE_GRE_IP
-    # shellcheck disable=SC1090
-    . "$cfg" 2>/dev/null || continue
-    dev="${TUNNEL_DEV:-gre1}"
-    state=$(ip -brief link show "$dev" 2>/dev/null | awk '{print $2}')
-    [ -n "$state" ] || continue
-    if [ "$shown" -eq 0 ]; then
-      echo ""
-      echo "  GRE Tunnels:"
-      shown=1
-    fi
-    printf "   - %-6s [%-4s]  local %-18s remote %s\n" \
-      "$dev" "$state" "${LOCAL_GRE_IP:-?}" "${REMOTE_GRE_IP:-?}"
-  done
-  if [ "$shown" -eq 1 ]; then
-    echo ""
-  fi
-fi
-EOF
+  # پاک‌سازی بنر نسخه‌های قدیمی
+  rm -f "$MOTD_LEGACY" 2>/dev/null || true
 
+  # helper: تولید خطوط «IPv4 address for <iface>: <ip>» برای تانل‌های فعال
+  cat > "$MOTD_HELPER" <<'HELPER'
+#!/bin/bash
+# gre.sh helper: MOTD lines for active GRE tunnels
+CONF_DIR="/etc/gre-tunnel.d"
+for cfg in "$CONF_DIR"/*.conf; do
+  [ -e "$cfg" ] || continue
+  unset TUNNEL_DEV
+  # shellcheck disable=SC1090
+  . "$cfg" 2>/dev/null || continue
+  dev="${TUNNEL_DEV:-}"
+  [ -n "$dev" ] || continue
+  addr=$(ip -4 -brief addr show "$dev" 2>/dev/null | awk 'NR==1{print $3}')
+  [ -n "$addr" ] || continue
+  printf '  IPv4 address for %s: %s\n' "$dev" "${addr%/*}"
+done
+HELPER
+  chmod +x "$MOTD_HELPER" 2>/dev/null || true
+
+  # پشتیبان‌گیری از اسکریپت اصلی landscape (فقط اگر مربوط به خودمان نباشد)
+  if [ -e "$MOTD_FILE" ] && ! grep -q 'gre.sh landscape injector' "$MOTD_FILE" 2>/dev/null; then
+    if [ ! -e "$MOTD_ORIG" ]; then
+      mv -f "$MOTD_FILE" "$MOTD_ORIG" 2>/dev/null || true
+    else
+      rm -f "$MOTD_FILE" 2>/dev/null || true
+    fi
+  fi
+
+  # injector: خروجی landscape را می‌گیرد و خطوط تانل را داخل همان بلوک اضافه می‌کند
+  cat > "$MOTD_FILE" <<'INJECTOR'
+#!/bin/bash
+# gre.sh landscape injector — adds GRE tunnel IPv4 lines into the
+# "System information" block produced by landscape-sysinfo.
+MOTD_ORIG="/etc/update-motd.d/50-landscape-sysinfo.gre-orig"
+HELPER="/usr/local/bin/gre-motd-ip-lines"
+
+if [ -e "$MOTD_ORIG" ]; then
+  out=$(/bin/bash "$MOTD_ORIG" 2>/dev/null)
+elif [ -x /usr/bin/landscape-sysinfo ]; then
+  out=$(/usr/bin/landscape-sysinfo 2>/dev/null)
+else
+  out=""
+fi
+
+gre=$(/bin/bash "$HELPER" 2>/dev/null)
+
+if [ -z "$out" ]; then
+  [ -n "$gre" ] && printf '%s\n' "$gre"
+  exit 0
+fi
+
+if [ -z "$gre" ]; then
+  printf '%s\n' "$out"
+  exit 0
+fi
+
+# حذف خطوطی که landscape خودش نمایش داده تا تکراری نشود
+new=""
+while IFS= read -r l; do
+  [ -n "$l" ] || continue
+  dev="${l#  IPv4 address for }"
+  dev="${dev%%:*}"
+  if printf '%s\n' "$out" | grep -q "address for ${dev}:"; then
+    continue
+  fi
+  new="${new}${l}
+"
+done <<< "$gre"
+
+if [ -z "$new" ]; then
+  printf '%s\n' "$out"
+  exit 0
+fi
+
+tmp=$(mktemp)
+printf '%s' "$new" > "$tmp"
+printf '%s\n' "$out" | awk -v gf="$tmp" '
+{ line[NR]=$0 }
+END {
+  last=0
+  for (i=1;i<=NR;i++) if (line[i] ~ /^  IPv[46] address for /) last=i
+  if (last==0) for (i=1;i<=NR;i++) if (line[i] ~ /(Swap usage|Users logged in|Processes):/) last=i
+  if (last==0) last=NR
+  for (i=1;i<=NR;i++) {
+    print line[i]
+    if (i==last) { while ((getline g < gf) > 0) print g; close(gf) }
+  }
+}'
+rm -f "$tmp"
+INJECTOR
   chmod +x "$MOTD_FILE" 2>/dev/null || true
-  echo "[✓] Login banner installed: $MOTD_FILE"
+
+  echo "[✓] Tunnel IP will now appear inside the login 'System information' block."
 }
 
 uninstall_service() {
@@ -708,8 +697,18 @@ uninstall_service() {
     systemctl daemon-reload
   fi
   rm -f "$INSTALL_BIN"
-  rm -f "$MOTD_FILE"
-  echo "[✓] Service uninstalled, binary and login banner removed."
+  rm -f "$MOTD_HELPER" 2>/dev/null || true
+  rm -f "$MOTD_LEGACY" 2>/dev/null || true
+
+  # بازگرداندن اسکریپت اصلی landscape
+  if grep -q 'gre.sh landscape injector' "$MOTD_FILE" 2>/dev/null; then
+    rm -f "$MOTD_FILE"
+  fi
+  if [ -e "$MOTD_ORIG" ]; then
+    mv -f "$MOTD_ORIG" "$MOTD_FILE" 2>/dev/null || true
+  fi
+
+  echo "[✓] Service uninstalled, binary and login banner restored."
 }
 
 # شروع یک تانل ثبت‌شده در ساب‌شل (برای سرویس و منوی مدیریت)
@@ -772,18 +771,16 @@ show_menu() {
   echo "   Version:     v$VERSION"
   echo "   Server IPv4: ${server_ip:-Unknown}"
   echo "--------------------------------------"
-  echo "1) Configure / Start Tunnel"
-  echo "2) Check Tunnel Status"
-  echo "3) Management (all tunnels)"
-  echo "4) Remove Tunnel & Clean"
+  echo "1) Create new tunnel"
+  echo "2) Tunnels (select & manage)"
+  echo "3) Remove ALL tunnels & clean"
   echo "0) Exit"
   echo
-  read -rp "Select an option [0-4]: " CHOICE
+  read -rp "Select an option [0-3]: " CHOICE
   case "$CHOICE" in
     1) menu_config_tunnel ;;
-    2) status_check ;;
-    3) menu_management ;;
-    4) remove_tun ;;
+    2) select_tunnel_menu ;;
+    3) remove_tun ;;
     0) echo "Exiting..."; exit 0 ;;
     *) echo "[-] Invalid option."; sleep 1; return ;;
   esac
