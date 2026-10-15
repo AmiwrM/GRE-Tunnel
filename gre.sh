@@ -3,7 +3,7 @@
 # هر عملیات خطاپذیر خودش خطا را مدیریت می‌کند.
 set -o pipefail
 
-VERSION="2.1.0"
+VERSION="2.2.0"
 
 CONF_FILE="/etc/gre-tunnel.conf"
 CONF_DIR="/etc/gre-tunnel.d"
@@ -371,7 +371,7 @@ remove_tun() {
 #  منوی Management: مدیریت تمام تانل‌های ثبت‌شده توسط این اسکریپت
 # ------------------------------------------------------------------
 
-# نمایش وضعیت یک تانل به همراه ۴ درخواست پینگ بین آی‌پی‌های تانل
+# نمایش وضعیت/محتویات یک تانل (بدون تست پینگ)
 show_tunnel_status_from_config() {
   local cfg=$1
   local dev role lpub rpub lgre rgre mtu
@@ -384,8 +384,8 @@ show_tunnel_status_from_config() {
   echo "    Config:            $cfg"
   echo "    Local Public IP:   ${lpub:-N/A}"
   echo "    Remote Public IP:  ${rpub:-N/A}"
-  echo "    Local GRE IP:      ${lgre:-N/A}"
-  echo "    Remote GRE IP:     ${rgre:-N/A}"
+  echo "    Local Tunnel IP:   ${lgre:-N/A}"
+  echo "    Remote Tunnel IP:  ${rgre:-N/A}"
 
   if ip link show "$dev" >/dev/null 2>&1; then
     local link_state local_addr
@@ -396,24 +396,7 @@ show_tunnel_status_from_config() {
   else
     echo "    Link State:        DOWN (interface missing) [✗]"
   fi
-
-  # پینگ به آی‌پی داخلی تانل سمت مقابل - ۴ درخواست
-  local target="${rgre%/}"
-  if [ -z "$target" ]; then
-    echo "    Ping Test:         skipped (remote GRE IP unknown)"
-    return
-  fi
-
-  echo "    Ping Test -> $target (4 requests):"
-  local result
-  result=$(ping -c 4 -W 2 "$target" 2>&1 || true)
-  if echo "$result" | grep -qE '[1-9][0-9]* (packets )?received'; then
-    local rtt
-    rtt=$(echo "$result" | awk -F'/' '/rtt|round-trip/ {print $5}')
-    echo "      -> Tunnel Link is ACTIVE [✓] (avg latency: ~${rtt:-?} ms)"
-  else
-    echo "      -> Tunnel Link is DOWN / NOT RESPONDING [✗]"
-  fi
+  echo "--------------------------------------"
 }
 
 # ساخت آرایه‌ای از مسیر کانفیگ تانل‌های ثبت‌شده
@@ -456,7 +439,7 @@ delete_tunnel_record() {
   echo "[✓] Tunnel '$dev' removed."
 }
 
-# منوی یک تانل خاص: نمایش محتویات + عملیات
+# منوی یک تانل خاص: عملیات Status / Restart / Delete
 tunnel_actions_menu() {
   local cfg=$1
   local dev
@@ -468,20 +451,23 @@ tunnel_actions_menu() {
     echo "======================================"
     echo "             Tunnel: $dev"
     echo "======================================"
-    show_tunnel_status_from_config "$cfg"
-    echo
-    echo "1) Restart this tunnel"
-    echo "2) Delete this tunnel"
+    echo "1) Status / details"
+    echo "2) Restart this tunnel"
+    echo "3) Delete this tunnel"
     echo "0) Back"
     echo
-    read -rp "Select an option [0-2]: " tchoice
+    read -rp "Select an option [0-3]: " tchoice
     case "$tchoice" in
       1)
+        echo
+        show_tunnel_status_from_config "$cfg"
+        ;;
+      2)
         echo
         echo "[*] Restarting tunnel '$dev'..."
         start_tunnel_from_config "$cfg"
         ;;
-      2)
+      3)
         local confirm
         read -rp "Delete tunnel '$dev' and its config? [y/N]: " confirm
         case "$confirm" in
@@ -575,6 +561,9 @@ EOF
   systemctl daemon-reload
   systemctl enable --now gre-tunnel.service
 
+  # اطمینان از نصب/به‌روزرسانی بنر ورود
+  install_motd || true
+
   if systemctl is-active --quiet gre-tunnel.service; then
     echo "[✓] Service installed & enabled — tunnels will survive reboot."
   else
@@ -595,27 +584,11 @@ install_motd() {
   # پاک‌سازی بنر نسخه‌های قدیمی
   rm -f "$MOTD_LEGACY" 2>/dev/null || true
 
-  # helper: تولید خطوط «IPv4 address for <iface>: <ip>» برای تانل‌های فعال
-  cat > "$MOTD_HELPER" <<'HELPER'
-#!/bin/bash
-# gre.sh helper: MOTD lines for active GRE tunnels
-CONF_DIR="/etc/gre-tunnel.d"
-for cfg in "$CONF_DIR"/*.conf; do
-  [ -e "$cfg" ] || continue
-  unset TUNNEL_DEV
-  # shellcheck disable=SC1090
-  . "$cfg" 2>/dev/null || continue
-  dev="${TUNNEL_DEV:-}"
-  [ -n "$dev" ] || continue
-  addr=$(ip -4 -brief addr show "$dev" 2>/dev/null | awk 'NR==1{print $3}')
-  [ -n "$addr" ] || continue
-  printf '  IPv4 address for %s: %s\n' "$dev" "${addr%/*}"
-done
-HELPER
-  chmod +x "$MOTD_HELPER" 2>/dev/null || true
+  # helper قدیمی (نسخه قبل) دیگر لازم نیست
+  rm -f "$MOTD_HELPER" 2>/dev/null || true
 
   # پشتیبان‌گیری از اسکریپت اصلی landscape (فقط اگر مربوط به خودمان نباشد)
-  if [ -e "$MOTD_FILE" ] && ! grep -q 'gre.sh landscape injector' "$MOTD_FILE" 2>/dev/null; then
+  if [ -e "$MOTD_FILE" ] && ! grep -q 'gre.sh landscape sysinfo' "$MOTD_FILE" 2>/dev/null; then
     if [ ! -e "$MOTD_ORIG" ]; then
       mv -f "$MOTD_FILE" "$MOTD_ORIG" 2>/dev/null || true
     else
@@ -623,71 +596,151 @@ HELPER
     fi
   fi
 
-  # injector: خروجی landscape را می‌گیرد و خطوط تانل را داخل همان بلوک اضافه می‌کند
-  cat > "$MOTD_FILE" <<'INJECTOR'
-#!/bin/bash
-# gre.sh landscape injector — adds GRE tunnel IPv4 lines into the
-# "System information" block produced by landscape-sysinfo.
-MOTD_ORIG="/etc/update-motd.d/50-landscape-sysinfo.gre-orig"
-HELPER="/usr/local/bin/gre-motd-ip-lines"
+  # بنر: بلوک «System information» را با همان فرمت‌بند landscape می‌سازیم و
+  # آی‌پی تانل‌ها را به‌عنوان هدر اضافه می‌کنیم تا در ستون IPv4 تراز شوند.
+  cat > "$MOTD_FILE" <<'PYMOTD'
+#!/usr/bin/python3
+# gre.sh landscape sysinfo — renders the "System information" block and adds
+# GRE tunnel addresses so they appear aligned inside the IPv4 column.
+import os
+import subprocess
+import sys
+import time
 
-if [ -e "$MOTD_ORIG" ]; then
-  out=$(/bin/bash "$MOTD_ORIG" 2>/dev/null)
-elif [ -x /usr/bin/landscape-sysinfo ]; then
-  out=$(/usr/bin/landscape-sysinfo 2>/dev/null)
-else
-  out=""
-fi
+CONF_DIR = "/etc/gre-tunnel.d"
+CACHE = "/var/lib/landscape/landscape-sysinfo.cache"
+ORIG = "/etc/update-motd.d/50-landscape-sysinfo.gre-orig"
+CACHE_MAX_AGE = 60
 
-gre=$(/bin/bash "$HELPER" 2>/dev/null)
 
-if [ -z "$out" ]; then
-  [ -n "$gre" ] && printf '%s\n' "$gre"
-  exit 0
-fi
+def _ip_binary():
+    for candidate in ("/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip", "/bin/ip"):
+        if os.path.exists(candidate):
+            return candidate
+    return "ip"
 
-if [ -z "$gre" ]; then
-  printf '%s\n' "$out"
-  exit 0
-fi
 
-# حذف خطوطی که landscape خودش نمایش داده تا تکراری نشود
-new=""
-while IFS= read -r l; do
-  [ -n "$l" ] || continue
-  dev="${l#  IPv4 address for }"
-  dev="${dev%%:*}"
-  if printf '%s\n' "$out" | grep -q "address for ${dev}:"; then
-    continue
-  fi
-  new="${new}${l}
-"
-done <<< "$gre"
+IP_BIN = _ip_binary()
 
-if [ -z "$new" ]; then
-  printf '%s\n' "$out"
-  exit 0
-fi
 
-tmp=$(mktemp)
-printf '%s' "$new" > "$tmp"
-printf '%s\n' "$out" | awk -v gf="$tmp" '
-{ line[NR]=$0 }
-END {
-  last=0
-  for (i=1;i<=NR;i++) if (line[i] ~ /^  IPv[46] address for /) last=i
-  if (last==0) for (i=1;i<=NR;i++) if (line[i] ~ /(Swap usage|Users logged in|Processes):/) last=i
-  if (last==0) last=NR
-  for (i=1;i<=NR;i++) {
-    print line[i]
-    if (i==last) { while ((getline g < gf) > 0) print g; close(gf) }
-  }
-}'
-rm -f "$tmp"
-INJECTOR
+def read_conf(path):
+    data = {}
+    try:
+        with open(path, "r", errors="replace") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                data[key.strip()] = val.strip().strip('"').strip("'")
+    except OSError:
+        return {}
+    return data
+
+
+def gre_addresses():
+    result = []
+    if not os.path.isdir(CONF_DIR):
+        return result
+    for name in sorted(os.listdir(CONF_DIR)):
+        if not name.endswith(".conf"):
+            continue
+        conf = read_conf(os.path.join(CONF_DIR, name))
+        dev = conf.get("TUNNEL_DEV", "")
+        if not dev:
+            continue
+        try:
+            raw = subprocess.check_output(
+                [IP_BIN, "-4", "-brief", "addr", "show", dev],
+                stderr=subprocess.DEVNULL,
+            ).decode("utf-8", "replace")
+        except Exception:
+            continue
+        line = raw.splitlines()[0].strip() if raw.strip() else ""
+        parts = line.split()
+        if len(parts) >= 3 and "/" in parts[2]:
+            result.append((dev, parts[2].split("/")[0]))
+    return result
+
+
+def build_block():
+    from landscape.sysinfo.sysinfo import SysInfoPluginRegistry, format_sysinfo
+    from landscape.sysinfo.deployment import SysInfoConfiguration
+
+    registry = SysInfoPluginRegistry()
+    config = SysInfoConfiguration()
+    try:
+        config.load([], accept_nonexistent_default_config=True)
+    except TypeError:
+        config.load([])
+    for plugin in config.get_plugins():
+        registry.add(plugin)
+    registry.run()
+    for dev, ip in gre_addresses():
+        registry.add_header("IPv4 address for " + dev, ip)
+    width = getattr(config, "width", 80) or 80
+    return format_sysinfo(
+        registry.get_headers(),
+        registry.get_notes(),
+        registry.get_footnotes(),
+        width=width,
+        indent="  ",
+    )
+
+
+def original_output():
+    if os.path.exists(ORIG):
+        try:
+            return subprocess.check_output(["/bin/sh", ORIG]).decode("utf-8", "replace")
+        except Exception:
+            return ""
+    return ""
+
+
+def main():
+    try:
+        if os.path.isfile(CACHE) and (time.time() - os.path.getmtime(CACHE)) < CACHE_MAX_AGE:
+            with open(CACHE, "r", errors="replace") as fh:
+                sys.stdout.write(fh.read())
+            return
+    except OSError:
+        pass
+
+    try:
+        body = build_block()
+    except Exception:
+        fallback = original_output()
+        if fallback.strip():
+            sys.stdout.write(fallback)
+        else:
+            gre = "\n".join(
+                "  IPv4 address for %s: %s" % (d, i) for d, i in gre_addresses()
+            )
+            if gre:
+                sys.stdout.write("\n" + gre + "\n")
+        return
+
+    try:
+        date_str = subprocess.check_output(["/bin/date"]).decode().strip()
+    except Exception:
+        date_str = time.strftime("%a %b %d %H:%M:%S %Z %Y")
+
+    text = "\n System information as of %s\n\n%s\n" % (date_str, body)
+    try:
+        with open(CACHE, "w") as fh:
+            fh.write(text)
+        os.chmod(CACHE, 0o644)
+    except OSError:
+        pass
+    sys.stdout.write(text)
+
+
+if __name__ == "__main__":
+    main()
+PYMOTD
   chmod +x "$MOTD_FILE" 2>/dev/null || true
 
-  echo "[✓] Tunnel IP will now appear inside the login 'System information' block."
+  echo "[✓] Tunnel IP will appear aligned inside the login 'System information' block."
 }
 
 uninstall_service() {
@@ -701,7 +754,7 @@ uninstall_service() {
   rm -f "$MOTD_LEGACY" 2>/dev/null || true
 
   # بازگرداندن اسکریپت اصلی landscape
-  if grep -q 'gre.sh landscape injector' "$MOTD_FILE" 2>/dev/null; then
+  if grep -q 'gre.sh landscape sysinfo' "$MOTD_FILE" 2>/dev/null; then
     rm -f "$MOTD_FILE"
   fi
   if [ -e "$MOTD_ORIG" ]; then
