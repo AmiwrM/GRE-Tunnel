@@ -3,7 +3,7 @@
 # هر عملیات خطاپذیر خودش خطا را مدیریت می‌کند.
 set -o pipefail
 
-VERSION="2.2.0"
+VERSION="2.3.0"
 
 CONF_FILE="/etc/gre-tunnel.conf"
 CONF_DIR="/etc/gre-tunnel.d"
@@ -332,23 +332,61 @@ stop_tunnel() {
 remove_tun() {
   clear
   echo "======================================"
-  echo "       Remove Tunnel Interfaces       "
+  echo "     Remove Script Tunnels & Clean    "
   echo "======================================"
 
-  mapfile -t tunifs < <(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | cut -d'@' -f1 | grep -E '^(gre|gretap|erspan)' || true)
+  # فقط تانل‌هایی که از طریق همین اسکریپت ساخته/ثبت شده‌اند
+  collect_tunnel_records
 
-  if [ ${#tunifs[@]} -eq 0 ]; then
-    echo "[i] No GRE/GRETAP interfaces found."
-  else
-    for ifc in "${tunifs[@]}"; do
-      echo "[*] Removing $ifc..."
-      stop_tunnel "$ifc"
-      echo "[✓] $ifc removed."
+  # اگر کانفیگ اصلی (legacy) هم به تانل دیگری اشاره دارد، اضافه‌اش کن
+  local legacy_dev=""
+  if [ -f "$CONF_FILE" ]; then
+    IFS='|' read -r legacy_dev _ < <(config_fields "$CONF_FILE")
+  fi
+  if [ -n "$legacy_dev" ]; then
+    local found=0 cfg chk
+    for cfg in "${TUNNEL_RECORDS[@]}"; do
+      IFS='|' read -r chk _ < <(config_fields "$cfg")
+      if [ "$chk" = "$legacy_dev" ]; then
+        found=1
+        break
+      fi
     done
+    if [ "$found" -eq 0 ]; then
+      TUNNEL_RECORDS+=("$CONF_FILE")
+    fi
+  fi
+
+  if [ ${#TUNNEL_RECORDS[@]} -eq 0 ]; then
+    echo "[i] No tunnels are registered by this script."
+  else
+    local cfg dev
+    for cfg in "${TUNNEL_RECORDS[@]}"; do
+      IFS='|' read -r dev _ < <(config_fields "$cfg")
+      [ -n "$dev" ] || continue
+      echo "    - $dev"
+    done
+    echo
+    read -rp "Remove ALL of the above tunnels? [y/N]: " confirm
+    case "$confirm" in
+      [Yy]*)
+        for cfg in "${TUNNEL_RECORDS[@]}"; do
+          IFS='|' read -r dev _ < <(config_fields "$cfg")
+          [ -n "$dev" ] || continue
+          echo "[*] Removing $dev..."
+          stop_tunnel "$dev"
+          echo "[✓] $dev removed."
+        done
+        ;;
+      *)
+        echo "[i] Cancelled."
+        return
+        ;;
+    esac
   fi
 
   echo
-  read -rp "Remove saved configuration ($CONF_FILE)? [y/N]: " yn
+  read -rp "Remove saved configuration files? [y/N]: " yn
   case "$yn" in
     [Yy]*)
       rm -f "$CONF_FILE"
@@ -838,7 +876,7 @@ show_menu() {
   echo "--------------------------------------"
   echo "1) Create new tunnel"
   echo "2) Tunnels (select & manage)"
-  echo "3) Remove ALL tunnels & clean"
+  echo "3) Remove all script tunnels"
   echo "0) Exit"
   echo
   read -rp "Select an option [0-3]: " CHOICE
