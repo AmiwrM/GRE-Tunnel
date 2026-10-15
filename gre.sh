@@ -3,7 +3,7 @@ set -o pipefail
 
 VERSION="2.4.0"
 
-SCRIPT_URL="https://raw.githubusercontent.com/AmiwrM/gre/refs/heads/main/gre.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/AmiwrM/GRE-Tunnel/refs/heads/main/gre.sh"
 
 CONF_FILE="/etc/gre-tunnel.conf"
 CONF_DIR="/etc/gre-tunnel.d"
