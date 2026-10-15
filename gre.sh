@@ -1,15 +1,14 @@
 #!/bin/bash
-# با -e کار نمی‌کنیم تا هر خطای جزئی باعث خروج از اسکریپت نشود؛
-# هر عملیات خطاپذیر خودش خطا را مدیریت می‌کند.
 set -o pipefail
 
 VERSION="2.4.0"
+
+SCRIPT_URL="https://raw.githubusercontent.com/SETARENOVIN/gre/refs/heads/main/gre.sh"
 
 CONF_FILE="/etc/gre-tunnel.conf"
 CONF_DIR="/etc/gre-tunnel.d"
 INSTALL_BIN="/usr/local/bin/gre.sh"
 SERVICE_UNIT="/etc/systemd/system/gre-tunnel.service"
-# بنر ورود SSH: خطوط آی‌پی تانل داخل بلوک «System information» (landscape) تزریق می‌شوند
 MOTD_FILE="/etc/update-motd.d/50-landscape-sysinfo"
 MOTD_ORIG="/usr/local/share/gre-tunnel/50-landscape-sysinfo.gre-orig"
 MOTD_ORIG_LEGACY="/etc/update-motd.d/50-landscape-sysinfo.gre-orig"
@@ -34,12 +33,10 @@ validate_ipv4() {
   IFS='.' read -r -a octets <<< "$ip"
   local octet
   for octet in "${octets[@]}"; do
-    # 10# باعث می‌شود عدد با صفر ابتدایی هم اعشاری تفسیر شود (نه اکتال)
     if ((10#$octet > 255)); then
       return 1
     fi
   done
-  # رد کردن آدرس‌های رزرو/نامعتبر برای سمت عمومی
   if [ "$ip" = "0.0.0.0" ] || [ "$ip" = "255.255.255.255" ]; then
     return 1
   fi
@@ -60,7 +57,6 @@ validate_cidr_ipv4() {
   validate_ipv4 "$ip"
 }
 
-# نام اینترفیس: فقط حروف/عدد/نقطه/خط‌تیره، حداکثر ۱۵ کاراکتر (محدودیت کرنل)
 validate_dev_name() {
   local dev=$1
   [ -n "$dev" ] || return 1
@@ -71,7 +67,6 @@ validate_dev_name() {
   return 0
 }
 
-# MTU معتبر: عددی و در بازه‌ی منطقی
 validate_mtu() {
   local mtu=$1
   [ -n "$mtu" ] || return 1
@@ -89,7 +84,6 @@ detect_local_public_ip() {
   echo "$detected"
 }
 
-# آی‌پی سرور یک‌بار تشخیص داده و کش می‌شود تا منو سریع باز شود
 CACHED_SERVER_IPV4=""
 get_server_ipv4_cached() {
   if [ -z "$CACHED_SERVER_IPV4" ]; then
@@ -98,7 +92,6 @@ get_server_ipv4_cached() {
   printf '%s' "$CACHED_SERVER_IPV4"
 }
 
-# پیدا کردن اولین اینترفیس gre آزاد (gre1, gre2, ...)
 next_tunnel_dev() {
   local i=1
   while ip link show "gre$i" >/dev/null 2>&1; do
@@ -107,8 +100,6 @@ next_tunnel_dev() {
   echo "gre$i"
 }
 
-# نوشتن امن کانفیگ: با %q مقادیر escape می‌شوند تا هنگام source شدن
-# هیچ دستور دلخواهی اجرا نشود (جلوگیری از command injection)
 write_config_block() {
   local file=$1
   {
@@ -124,7 +115,6 @@ write_config_block() {
   chmod 600 "$file"
 }
 
-# ثبت تانل در پوشه‌ی مدیریت تا در منوی Management قابل مشاهده/حذف باشد
 save_tunnel_record() {
   local quiet=${1:-0}
   mkdir -p "$CONF_DIR"
@@ -143,7 +133,6 @@ save_config() {
 
 load_config() {
   if [ -f "$CONF_FILE" ]; then
-    # shellcheck disable=SC1090
     source "$CONF_FILE"
     TUNNEL_DEV="${TUNNEL_DEV:-$DEFAULT_TUNNEL_DEV}"
     MTU_VAL="${MTU_VAL:-$DEFAULT_MTU}"
@@ -152,13 +141,10 @@ load_config() {
   return 1
 }
 
-# خواندن فیلدهای یک فایل کانفیگ به صورت رشته‌ی جدا شده با |
-# خروجی: dev|role|local_pub|remote_pub|local_gre|remote_gre|mtu
 config_fields() {
   local cfg=$1
   (
     set +u
-    # shellcheck disable=SC1090
     source "$cfg" 2>/dev/null || true
     printf '%s|%s|%s|%s|%s|%s|%s' \
       "${TUNNEL_DEV:-}" "${SERVER_ROLE:-}" "${LOCAL_PUBLIC_IP:-}" \
@@ -166,7 +152,6 @@ config_fields() {
   )
 }
 
-# فهرست فایل‌های کانفیگ تانل‌های ثبت‌شده (هر خط یک مسیر)
 list_tunnel_records() {
   local cfg
   for cfg in "$CONF_DIR"/*.conf; do
@@ -190,7 +175,6 @@ apply_firewall_and_sysctl() {
     iptables -C INPUT -p gre -j ACCEPT 2>/dev/null || iptables -A INPUT -p gre -j ACCEPT
     iptables -C OUTPUT -p gre -j ACCEPT 2>/dev/null || iptables -A OUTPUT -p gre -j ACCEPT
 
-    # MSS Clamping جهت جلوگیری از افت پکت و کندی وب
     iptables -t mangle -C FORWARD -o "$dev" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || \
       iptables -t mangle -A FORWARD -o "$dev" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
   fi
@@ -203,7 +187,6 @@ remove_firewall_rules() {
   fi
 }
 
-# حذف قوانین عمومی GRE (INPUT/OUTPUT) — فقط هنگام حذف کامل استفاده می‌شود
 remove_global_firewall_rules() {
   if command -v iptables >/dev/null 2>&1; then
     while iptables -D INPUT -p gre -j ACCEPT 2>/dev/null; do :; done
@@ -258,11 +241,9 @@ create_tunnel() {
 
   modprobe ip_gre 2>/dev/null || true
 
-  # ریست اینترفیس قبلی
   ip link set "$TUNNEL_DEV" down 2>/dev/null || true
   ip tunnel del "$TUNNEL_DEV" 2>/dev/null || true
 
-  # ساخت تانل
   if ! ip tunnel add "$TUNNEL_DEV" mode gre local "$LOCAL_PUBLIC_IP" remote "$REMOTE_PUBLIC_IP" ttl 255; then
     echo "[-] Failed to create GRE interface '$TUNNEL_DEV'." >&2
     return 1
@@ -291,12 +272,10 @@ create_tunnel() {
   echo
   echo "[✓] GRE tunnel interface ($TUNNEL_DEV) is successfully UP!"
 
-  # ثبت خودکار تانل ساخته‌شده برای منوی Management
   save_tunnel_record 1
 
   if [ "$interactive" -eq 1 ]; then
     echo
-    # ذخیرهٔ خودکار کانفیگ + فعال‌سازی ماندگاری پس از ریبوت
     save_config
     echo
     install_service || echo "[-] Boot persistence could not be enabled (service setup failed)."
@@ -348,7 +327,6 @@ menu_config_tunnel() {
     return
   fi
 
-  # آی‌پی‌های داخلی تانل: کاربر کامل با CIDR وارد می‌کند
   local default_local default_remote
   if [ "$ROLE" == "1" ]; then
     default_local="10.10.10.1/24"
@@ -407,10 +385,8 @@ remove_tun() {
   echo "     Remove Script Tunnels & Clean    "
   echo "======================================"
 
-  # فقط تانل‌هایی که از طریق همین اسکریپت ساخته/ثبت شده‌اند
   collect_tunnel_records
 
-  # اگر کانفیگ اصلی (legacy) هم به تانل دیگری اشاره دارد، اضافه‌اش کن
   local legacy_dev=""
   if [ -f "$CONF_FILE" ]; then
     IFS='|' read -r legacy_dev _ < <(config_fields "$CONF_FILE")
@@ -478,11 +454,7 @@ remove_tun() {
   fi
 }
 
-# ------------------------------------------------------------------
-#  منوی Management: مدیریت تمام تانل‌های ثبت‌شده توسط این اسکریپت
-# ------------------------------------------------------------------
 
-# نمایش وضعیت/محتویات یک تانل (بدون تست پینگ)
 show_tunnel_status_from_config() {
   local cfg=$1
   local dev role lpub rpub lgre rgre mtu
@@ -510,7 +482,6 @@ show_tunnel_status_from_config() {
   echo "--------------------------------------"
 }
 
-# ساخت آرایه‌ای از مسیر کانفیگ تانل‌های ثبت‌شده
 collect_tunnel_records() {
   local line
   TUNNEL_RECORDS=()
@@ -520,13 +491,11 @@ collect_tunnel_records() {
     fi
   done < <(list_tunnel_records)
 
-  # سازگاری با کانفیگ قدیمی (تک‌تانلی) که در پوشه‌ی مدیریت ثبت نشده است
   if [ ${#TUNNEL_RECORDS[@]} -eq 0 ] && [ -f "$CONF_FILE" ]; then
     TUNNEL_RECORDS+=("$CONF_FILE")
   fi
 }
 
-# حذف یک تانل (اینترفیس + رکورد کانفیگ)
 delete_tunnel_record() {
   local cfg=$1
   local dev
@@ -537,7 +506,6 @@ delete_tunnel_record() {
   stop_tunnel "$dev"
   rm -f "$cfg"
 
-  # اگر کانفیگ اصلی (legacy) مربوط به همین تانل بود، آن را هم پاک کن
   if [ -f "$CONF_FILE" ]; then
     local legacy_dev
     IFS='|' read -r legacy_dev _ < <(config_fields "$CONF_FILE")
@@ -550,7 +518,6 @@ delete_tunnel_record() {
   echo "[✓] Tunnel '$dev' removed."
 }
 
-# منوی یک تانل خاص: عملیات Status / Restart / Delete
 tunnel_actions_menu() {
   local cfg=$1
   local dev
@@ -594,7 +561,6 @@ tunnel_actions_menu() {
   done
 }
 
-# منوی انتخاب اینترفیس (تانل‌ها با نام اینترفیس منو می‌شوند)
 select_tunnel_menu() {
   while true; do
     clear
@@ -639,22 +605,34 @@ install_service() {
   fi
 
   local script_source="${BASH_SOURCE[0]:-$0}"
-  if [ ! -f "$script_source" ]; then
-    script_source="$(command -v "$0" || true)"
-  fi
-
-  if [ ! -f "$script_source" ]; then
-    echo "[-] Cannot detect script file path directly." >&2
-    echo "[-] Please save the script to a file (e.g. /root/gre.sh) and run with: bash /root/gre.sh" >&2
-    return 1
+  local have_source=0
+  if [ -n "$script_source" ] && [ -f "$script_source" ]; then
+    have_source=1
   fi
 
   mkdir -p "$(dirname "$INSTALL_BIN")"
-  if [ "$script_source" != "$INSTALL_BIN" ]; then
+
+  if [ "$have_source" -eq 1 ] && [ "$script_source" != "$INSTALL_BIN" ]; then
     cp -f -- "$script_source" "$INSTALL_BIN" || {
       echo "[-] Failed to copy script to $INSTALL_BIN." >&2
       return 1
     }
+  elif [ "$have_source" -eq 0 ]; then
+    if command -v curl >/dev/null 2>&1; then
+      curl -fsSL "$SCRIPT_URL" -o "$INSTALL_BIN" || {
+        echo "[-] Could not download script to $INSTALL_BIN." >&2
+        return 1
+      }
+    elif command -v wget >/dev/null 2>&1; then
+      wget -qO "$INSTALL_BIN" "$SCRIPT_URL" || {
+        echo "[-] Could not download script to $INSTALL_BIN." >&2
+        return 1
+      }
+    else
+      echo "[-] Cannot detect script path and no curl/wget available." >&2
+      echo "[-] Save the script to a file and run: bash /root/gre.sh" >&2
+      return 1
+    fi
   fi
   chmod 755 "$INSTALL_BIN" 2>/dev/null || true
 
@@ -677,7 +655,6 @@ EOF
   systemctl daemon-reload
   systemctl enable --now gre-tunnel.service
 
-  # اطمینان از نصب/به‌روزرسانی بنر ورود
   install_motd || true
 
   if systemctl is-active --quiet gre-tunnel.service; then
@@ -688,7 +665,6 @@ EOF
   fi
 }
 
-# نصب بنر ورود SSH: خطوط آی‌پی تانل داخل بلوک «System information» تزریق می‌شوند
 install_motd() {
   local dir
   dir="$(dirname "$MOTD_FILE")"
@@ -697,14 +673,10 @@ install_motd() {
     return 0
   fi
 
-  # پاک‌سازی بنر نسخه‌های قدیمی
   rm -f "$MOTD_LEGACY" 2>/dev/null || true
 
-  # helper قدیمی (نسخه قبل) دیگر لازم نیست
   rm -f "$MOTD_HELPER" 2>/dev/null || true
 
-  # مهاجرت بکاپ قدیمی که اشتباهاً داخل پوشه‌ی motd بود
-  # (وجود فایل قابل‌اجرا در /etc/update-motd.d باعث اجرای دوباره و چاپ تکراری بلوک می‌شد)
   mkdir -p "$(dirname "$MOTD_ORIG")" 2>/dev/null || true
   if [ -e "$MOTD_ORIG_LEGACY" ]; then
     if [ ! -e "$MOTD_ORIG" ]; then
@@ -713,8 +685,7 @@ install_motd() {
     rm -f "$MOTD_ORIG_LEGACY" 2>/dev/null || true
   fi
 
-  # پشتیبان‌گیری از اسکریپت اصلی landscape (فقط اگر مربوط به خودمان نباشد)
-  if [ -e "$MOTD_FILE" ] && ! grep -q 'gre.sh landscape sysinfo' "$MOTD_FILE" 2>/dev/null; then
+  if [ -e "$MOTD_FILE" ] && ! grep -q 'gre-tunnel-motd.cache' "$MOTD_FILE" 2>/dev/null; then
     if [ ! -e "$MOTD_ORIG" ]; then
       mv -f "$MOTD_FILE" "$MOTD_ORIG" 2>/dev/null || true
     else
@@ -722,12 +693,8 @@ install_motd() {
     fi
   fi
 
-  # بنر: بلوک «System information» را با همان فرمت‌بند landscape می‌سازیم و
-  # آی‌پی تانل‌ها را به‌عنوان هدر اضافه می‌کنیم تا در ستون IPv4 تراز شوند.
   cat > "$MOTD_FILE" <<'PYMOTD'
 #!/usr/bin/python3
-# gre.sh landscape sysinfo — renders the "System information" block and adds
-# GRE tunnel addresses so they appear aligned inside the IPv4 column.
 import os
 import subprocess
 import sys
@@ -881,8 +848,7 @@ uninstall_service() {
   rm -f "$MOTD_LEGACY" 2>/dev/null || true
   rm -f "$MOTD_ORIG_LEGACY" 2>/dev/null || true
 
-  # بازگرداندن اسکریپت اصلی landscape
-  if grep -q 'gre.sh landscape sysinfo' "$MOTD_FILE" 2>/dev/null; then
+  if grep -q 'gre-tunnel-motd.cache' "$MOTD_FILE" 2>/dev/null; then
     rm -f "$MOTD_FILE"
   fi
   if [ -e "$MOTD_ORIG" ]; then
@@ -892,12 +858,10 @@ uninstall_service() {
   echo "[✓] Service uninstalled, binary and login banner restored."
 }
 
-# شروع یک تانل ثبت‌شده در ساب‌شل (برای سرویس و منوی مدیریت)
 start_tunnel_from_config() {
   local cfg=$1
   (
     set +u
-    # shellcheck disable=SC1090
     source "$cfg" 2>/dev/null || true
     TUNNEL_DEV="${TUNNEL_DEV:-$DEFAULT_TUNNEL_DEV}"
     MTU_VAL="${MTU_VAL:-$DEFAULT_MTU}"
@@ -914,7 +878,6 @@ service_start() {
     start_tunnel_from_config "$cfg" || true
   done < <(list_tunnel_records)
 
-  # سازگاری با کانفیگ قدیمی تک‌تانلی
   if [ "$started" -eq 0 ] && [ -f "$CONF_FILE" ]; then
     load_config && create_tunnel 0
     started=1
@@ -969,7 +932,6 @@ show_menu() {
   read -rp "Press Enter to continue..." _
 }
 
-# Entrypoint
 case "${1:-}" in
   --service)
     ensure_root
