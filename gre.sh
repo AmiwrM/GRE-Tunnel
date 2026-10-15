@@ -11,7 +11,8 @@ INSTALL_BIN="/usr/local/bin/gre.sh"
 SERVICE_UNIT="/etc/systemd/system/gre-tunnel.service"
 # بنر ورود SSH: خطوط آی‌پی تانل داخل بلوک «System information» (landscape) تزریق می‌شوند
 MOTD_FILE="/etc/update-motd.d/50-landscape-sysinfo"
-MOTD_ORIG="/etc/update-motd.d/50-landscape-sysinfo.gre-orig"
+MOTD_ORIG="/usr/local/share/gre-tunnel/50-landscape-sysinfo.gre-orig"
+MOTD_ORIG_LEGACY="/etc/update-motd.d/50-landscape-sysinfo.gre-orig"
 MOTD_HELPER="/usr/local/bin/gre-motd-ip-lines"
 MOTD_LEGACY="/etc/update-motd.d/99-gre-tunnel"
 DEFAULT_TUNNEL_DEV="gre1"
@@ -587,6 +588,16 @@ install_motd() {
   # helper قدیمی (نسخه قبل) دیگر لازم نیست
   rm -f "$MOTD_HELPER" 2>/dev/null || true
 
+  # مهاجرت بکاپ قدیمی که اشتباهاً داخل پوشه‌ی motd بود
+  # (وجود فایل قابل‌اجرا در /etc/update-motd.d باعث اجرای دوباره و چاپ تکراری بلوک می‌شد)
+  mkdir -p "$(dirname "$MOTD_ORIG")" 2>/dev/null || true
+  if [ -e "$MOTD_ORIG_LEGACY" ]; then
+    if [ ! -e "$MOTD_ORIG" ]; then
+      mv -f "$MOTD_ORIG_LEGACY" "$MOTD_ORIG" 2>/dev/null || true
+    fi
+    rm -f "$MOTD_ORIG_LEGACY" 2>/dev/null || true
+  fi
+
   # پشتیبان‌گیری از اسکریپت اصلی landscape (فقط اگر مربوط به خودمان نباشد)
   if [ -e "$MOTD_FILE" ] && ! grep -q 'gre.sh landscape sysinfo' "$MOTD_FILE" 2>/dev/null; then
     if [ ! -e "$MOTD_ORIG" ]; then
@@ -608,8 +619,8 @@ import sys
 import time
 
 CONF_DIR = "/etc/gre-tunnel.d"
-CACHE = "/var/lib/landscape/landscape-sysinfo.cache"
-ORIG = "/etc/update-motd.d/50-landscape-sysinfo.gre-orig"
+CACHE = "/run/gre-tunnel-motd.cache"
+ORIG = "/usr/local/share/gre-tunnel/50-landscape-sysinfo.gre-orig"
 CACHE_MAX_AGE = 60
 
 
@@ -752,6 +763,7 @@ uninstall_service() {
   rm -f "$INSTALL_BIN"
   rm -f "$MOTD_HELPER" 2>/dev/null || true
   rm -f "$MOTD_LEGACY" 2>/dev/null || true
+  rm -f "$MOTD_ORIG_LEGACY" 2>/dev/null || true
 
   # بازگرداندن اسکریپت اصلی landscape
   if grep -q 'gre.sh landscape sysinfo' "$MOTD_FILE" 2>/dev/null; then
